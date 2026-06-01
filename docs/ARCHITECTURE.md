@@ -31,7 +31,7 @@ their types upward into core.
 `openlogi-hid` and `openlogi-hook` each depend on core and add one capability:
 the HID++ protocol and the macOS input hook, respectively. `openlogi-assets` is
 a second foundation crate — it has no internal dependencies (not even on core)
-and provides the device asset registry schema plus HTTP fetch helpers for the
+and provides the device-render registry schema plus HTTP fetch helpers for the
 `assets.openlogi.org` host. `openlogi-cli` and `openlogi-gui` sit at the top and
 compose the lower crates into the `openlogi` and `openlogi-gui` binaries: the
 CLI builds on core, hid, and assets; the GUI builds on core, hid, hook, and
@@ -198,7 +198,7 @@ bulk `assets sync` at packaging time, and the GUI's per-device fetch at startup.
 - `list` — enumerate the connected Logitech HID++ devices.
 - `assets sync` — pull the device-render registry from `assets.openlogi.org`.
 - `diag` — real-device round-trip smoke tests against the HID++ write path
-  (`features`, `dpi`).
+  (`features`, `dpi`, `smartshift`).
 
 See [`USAGE.md`](USAGE.md) for the full CLI reference.
 

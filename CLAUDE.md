@@ -103,7 +103,7 @@ The non-obvious traps. Details and code references in
 The variant *names* of `Action`, `ButtonId`, and `GestureDirection` are the
 on-disk `config.toml` schema (serde external tagging). Appending new variants
 is safe; renaming or removing one is a migration event that requires bumping
-`Config::SCHEMA_VERSION`.
+the `SCHEMA_VERSION` in `config.rs`.
 
 ## 7. Pointers
 
