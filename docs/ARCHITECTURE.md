@@ -233,9 +233,10 @@ Three walkthroughs that cross crate boundaries.
 
 **Startup & inventory.** On launch the GUI gathers the HID++ inventory
 **synchronously on the main thread** (GPUI owns the main thread, so the
-blocking `enumerate_blocking` call cannot move onto a tokio runtime):
-`openlogi-hid::enumerate` merges Bolt arrival events, the per-slot pairing
-register, and direct probes. It then builds the device list and resolves each
+blocking `enumerate_blocking` wrapper cannot move onto a tokio runtime). That
+wrapper calls `openlogi-hid::enumerate`, which merges Bolt arrival events, the
+per-slot pairing register, and direct probes. It then builds the device list
+and resolves each
 device's assets (`openlogi-assets`) and current DPI / SmartShift state,
 populating `AppState`. A separate 2-second watcher thread re-enumerates
 afterwards for hot-plug.
