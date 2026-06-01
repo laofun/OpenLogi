@@ -179,3 +179,25 @@ and must return quickly — blocking it stalls system-wide input.
 On non-macOS targets `Hook` is uninhabited (an `Infallible` field), so it can
 never be constructed and `start` only ever returns `HookError::Unsupported`.
 The crate still compiles cleanly on every target.
+
+## 5. openlogi-assets
+
+The device-render asset layer. It defines the registry schema (`index`,
+`manifest`, `metadata`) and an `AssetClient` (in `http.rs`) that fetches device
+renders from `assets.openlogi.org`, verifies each download against its `sha256`,
+and caches it on disk. The crate is deliberately I/O-light — parsing, HTTP, and
+hashing only, with no opinion on where files land. Two consumers: the CLI's
+bulk `assets sync` at packaging time, and the GUI's per-device fetch at startup.
+
+## 6. openlogi-cli
+
+`run()` initialises tracing (filtered by the `OPENLOGI_LOG` env var, default
+`info`) and the clap parser, then dispatches the command tree — defaulting to
+`list` when no subcommand is given. Commands live under `src/cmd/`:
+
+- `list` — enumerate the connected Logitech HID++ devices.
+- `assets sync` — pull the device-render registry from `assets.openlogi.org`.
+- `diag` — real-device round-trip smoke tests against the HID++ write path
+  (`features`, `dpi`).
+
+See [`USAGE.md`](USAGE.md) for the full CLI reference.
