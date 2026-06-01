@@ -108,8 +108,9 @@ re-implemented here:
 | Thumbwheel | `0x2150` | `thumbwheel.rs` | divert the MX thumb wheel |
 
 **The feature-resolution workaround (critical).** `hidpp 0.2`'s central feature
-registry is effectively empty for these IDs, so a `get_feature::<F>()` keyed by
-the wrapper's `TypeId` returns `None`. `write::open_feature` works around this:
+registry reports `versions: &[]` for the features OpenLogi cares about, so a
+`get_feature::<F>()` keyed by the wrapper's `TypeId` returns `None`.
+`open_feature` (in `write.rs`) works around this:
 it asks the device's *root* feature for the index of a feature ID
 (`device.root().get_feature(F::ID)`, which returns the assigned index
 unconditionally) and then attaches the typed wrapper to that index with
