@@ -158,6 +158,7 @@ cost per write.
 buttons. It holds **one** channel open, diverts the gesture button (raw-XY),
 the DPI/ModeShift buttons, and — only when its click is bound — the thumb
 wheel, then runs a single message listener that decodes events into
-`CapturedInput` (gesture, button press, scroll). A swipe is committed once the
-hold passes the ~160 ms gate (`GESTURE_HOLD_FOR_SWIPE`), mid-swipe. On shutdown
-it restores every diverted control to its native behaviour.
+`CapturedInput` (gesture, button press, scroll). A swipe is committed
+mid-gesture, as soon as the hold passes the ~160 ms gate
+(`GESTURE_HOLD_FOR_SWIPE`). On shutdown it restores every diverted control to
+its native behaviour.
