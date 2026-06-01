@@ -1,10 +1,13 @@
 # OpenLogi Architecture
 
-OpenLogi is a six-crate Cargo workspace — a native, local-first alternative to
-Logitech Options+ that controls Logitech mice over HID++. This document traces
-the crate layering and the HID++ flow end to end. For the quick orientation an
-AI agent needs before touching code, start with [`../CLAUDE.md`](../CLAUDE.md);
-for the developer workflow see [`DEVELOPMENT.md`](DEVELOPMENT.md).
+OpenLogi is built from six application crates in a Cargo workspace — a native,
+local-first alternative to Logitech Options+ that controls Logitech mice over
+HID++. (A seventh member, `xtask`, is a `publish = false` build helper that
+generates the updater manifest; it is not part of the application.) This
+document traces the crate layering and the HID++ flow end to end. For the quick
+orientation an AI agent needs before touching code, start with
+[`../CLAUDE.md`](../CLAUDE.md); for the developer workflow see
+[`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 ## 1. Overview
 
@@ -72,9 +75,14 @@ needs on top of the `hidpp` and `async-hid` libraries. Read it bottom-up.
 ### 3.1 Transport (`transport.rs`)
 
 `RawHidChannel` adapts `async-hid` to the byte channel `hidpp` expects.
-Enumeration pre-filters HID nodes to the Logitech vendor id (`0x046d`) and the
-HID++ long-report usage page / usage id (`0xff00` / `0x0002`), so non-HID++
-interfaces are dropped before any channel is opened.
+Enumeration pre-filters HID nodes to the Logitech vendor id (`0x046d`) and one
+of the HID++ long-report collections, so non-HID++ interfaces are dropped
+before any channel is opened. Two collections are recognised: `0xff00 / 0x0002`
+(USB, Logi Bolt / Unifying receivers, and Bluetooth-classic devices) and
+`0xff43 / 0x0202` (Bluetooth-Low-Energy directly-paired mice such as the Lift
+and Signature, which sit on a different vendor page). A BLE-direct device
+exposes only the long report on macOS, so its channel is flagged `long_only`
+and short messages are up-converted to long.
 `supports_short_long_hidpp()` is hardcoded to `Some((true, true))` to avoid
 the report-descriptor inspection path, which is Linux-only in the upstream
 library.

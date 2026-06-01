@@ -5,12 +5,13 @@ Orientation for AI agents working in this repository. Read this first, then
 
 ## 1. What this is
 
-OpenLogi is a six-crate Rust workspace — a native, local-first alternative to
-Logitech Options+ that controls Logitech mice over HID++ (via a Logi Bolt
-receiver, a direct Bluetooth link, or a USB cable). macOS is the supported
-platform today; Linux and Windows are stubs that compile but do nothing. The
-workspace builds two binaries: `openlogi` (CLI) and `openlogi-gui` (a GPUI
-desktop app).
+OpenLogi is a Rust workspace of six application crates — a native, local-first
+alternative to Logitech Options+ that controls Logitech mice over HID++ (via a
+Logi Bolt receiver, a direct Bluetooth link, or a USB cable). macOS is the
+supported platform today; Linux and Windows are stubs that compile but do
+nothing. The workspace builds two binaries: `openlogi` (CLI) and `openlogi-gui`
+(a GPUI desktop app). A seventh member, `xtask`, is a `publish = false` build
+helper (it generates the updater manifest), not part of the application.
 
 ## 2. Build / run / test
 
