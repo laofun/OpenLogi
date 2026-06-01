@@ -36,3 +36,30 @@ and provides the device asset registry schema plus HTTP fetch helpers for the
 compose the lower crates into the `openlogi` and `openlogi-gui` binaries: the
 CLI builds on core, hid, and assets; the GUI builds on core, hid, hook, and
 assets.
+
+## 2. openlogi-core
+
+The serializable data model and all device-agnostic logic.
+
+- **Data model (`device.rs`):** `DeviceInventory`, `PairedDevice`, and
+  `DeviceModelInfo`. `DeviceModelInfo::config_key()` returns
+  `format!("{:x}{:04x}", extended_model_id, model_ids[0])` (e.g. `"2b042"`) —
+  the join key that ties a physical device to its config entry and its asset
+  registry record.
+- **Config (`config.rs`):** TOML at the XDG path, carrying a `schema_version`
+  (`SCHEMA_VERSION = 1`). A `DeviceConfig` holds `button_bindings`,
+  `per_app_bindings`, `gesture_bindings`, and `dpi_presets`;
+  `effective_bindings` overlays the active app's per-app map on top of the
+  device defaults. Saves are atomic (write-temp-then-rename) and `0600` on
+  Unix. A schema-version gate guards migration.
+- **Bindings (`binding.rs`):** `ButtonId`, the `Action` catalog (37 built-in
+  actions), action `Category`, `detect_swipe`, and `GestureDirection`.
+  `Action::execute` synthesises the OS event on macOS — `CGEventPost` for
+  keys, clicks, and scroll; the Dock SPI `CoreDockSendNotification` for
+  Mission Control / App Exposé / Show Desktop / Launchpad. Device-side
+  actions (DPI cycle, SmartShift) carry no CGEvent and are deferred to the
+  hook/HID layer.
+- **Paths (`paths.rs`):** XDG base directories on every OS; the config file
+  lives at `~/.config/openlogi/config.toml`.
+
+See [Configuration](CONFIGURATION.md) for the on-disk file format.
