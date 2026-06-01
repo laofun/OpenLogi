@@ -9,14 +9,12 @@ for the developer workflow see [`DEVELOPMENT.md`](DEVELOPMENT.md).
 ## 1. Overview
 
 ```
-  openlogi-cli                  openlogi-gui      (top: the two binaries' logic)
-  -> core, hid, assets          -> core, hid, hook, assets
-
-       openlogi-hid     openlogi-hook            openlogi-assets
-       -> core          -> core                  (sibling foundation:
-            \              /                       no internal deps)
-             \            /
-              openlogi-core                       (foundation: no internal deps)
+  openlogi-cli   -> openlogi-core, openlogi-hid, openlogi-assets
+  openlogi-gui   -> openlogi-core, openlogi-hid, openlogi-hook, openlogi-assets
+  openlogi-hid   -> openlogi-core
+  openlogi-hook  -> openlogi-core
+  openlogi-core     (foundation: no internal deps)
+  openlogi-assets   (foundation: no internal deps)
 ```
 
 Read `->` as "depends on".
