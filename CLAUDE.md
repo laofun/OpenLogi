@@ -29,8 +29,7 @@ cargo test --workspace
 
 (Equivalent: `devenv tasks run openlogi:check`.) Notes: GPUI needs Xcode 16+
 with the Metal Toolchain component; after editing `devenv.nix`, run
-`direnv reload`. Logging is controlled by the `OPENLOGI_LOG` env filter
-(default `info`). Full workflow and packaging:
+`direnv reload`. Full workflow and packaging:
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
 ## 3. Crate map
@@ -46,7 +45,7 @@ core; `openlogi-cli` and `openlogi-gui` sit on top.
 | `openlogi-hook` | macOS `CGEventTap` mouse hook + Accessibility + frontmost-app detection. Stub elsewhere. |
 | `openlogi-assets` | Device-render registry schema + cached, sha256-verified HTTP fetch from `assets.openlogi.org`. |
 | `openlogi-cli` | CLI command tree (`list` / `diag` / `assets`) + `run()`. |
-| `openlogi-gui` | The `openlogi-gui` binary — GPUI + gpui-component desktop app. |
+| `openlogi-gui` | GPUI + gpui-component desktop app (the `openlogi-gui` binary). |
 
 ## 4. Conventions
 
