@@ -63,3 +63,33 @@ The serializable data model and all device-agnostic logic.
   lives at `~/.config/openlogi/config.toml`.
 
 See [`CONFIGURATION.md`](CONFIGURATION.md) for the on-disk file format.
+
+## 3. openlogi-hid — the HID++ flow
+
+This is the central crate. It re-implements the HID++ feature wrappers OpenLogi
+needs on top of the `hidpp` and `async-hid` libraries. Read it bottom-up.
+
+### 3.1 Transport (`transport.rs`)
+
+`RawHidChannel` adapts `async-hid` to the byte channel `hidpp` expects.
+Enumeration pre-filters HID nodes to the Logitech vendor id (`0x046d`) and the
+HID++ long-report usage page / usage id (`0xff00` / `0x0002`), so non-HID++
+interfaces are dropped before any channel is opened. `supports_short_long_hidpp()`
+is hardcoded to `Some((true, true))` to avoid the report-descriptor inspection
+path, which is Linux-only in the upstream library.
+
+### 3.2 Route (`route.rs`) — the addressing seam
+
+A controllable device is reached one of two ways:
+
+- `DeviceRoute::Bolt { receiver_uid, slot }` — paired to a Logi Bolt receiver,
+  addressed through the receiver's channel at a pairing slot (1..=6).
+- `DeviceRoute::Direct { vendor_id, product_id }` — attached straight to the
+  host over USB cable or Bluetooth, addressed on its own channel at the HID++
+  self-index `DIRECT_DEVICE_INDEX = 0xff`.
+
+`open_route_channel` is the **single place** the Bolt-vs-direct branch lives;
+both the write path and the capture session go through it. For a direct route
+it pre-filters candidates on vendor/product id before paying the ~100 ms
+channel-open cost — otherwise, on a host that also has a Bolt receiver, every
+direct write would needlessly open the receiver's channel first.
