@@ -74,9 +74,10 @@ needs on top of the `hidpp` and `async-hid` libraries. Read it bottom-up.
 `RawHidChannel` adapts `async-hid` to the byte channel `hidpp` expects.
 Enumeration pre-filters HID nodes to the Logitech vendor id (`0x046d`) and the
 HID++ long-report usage page / usage id (`0xff00` / `0x0002`), so non-HID++
-interfaces are dropped before any channel is opened. `supports_short_long_hidpp()`
-is hardcoded to `Some((true, true))` to avoid the report-descriptor inspection
-path, which is Linux-only in the upstream library.
+interfaces are dropped before any channel is opened.
+`supports_short_long_hidpp()` is hardcoded to `Some((true, true))` to avoid
+the report-descriptor inspection path, which is Linux-only in the upstream
+library.
 
 ### 3.2 Route (`route.rs`) — the addressing seam
 
