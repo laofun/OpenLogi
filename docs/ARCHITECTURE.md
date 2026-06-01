@@ -126,3 +126,38 @@ path.
   device hits the wrong functions and the device silently keeps its old state.
 - **AdjustableDpi `0x2201`** uses Short messages: function `0` = getSensorCount,
   `2` = getSensorDpi, `3` = setSensorDpi.
+
+### 3.4 Inventory (`inventory.rs`)
+
+`enumerate()` builds the device list. For each Bolt receiver it merges **two**
+data sources so it sees both awake and sleeping devices:
+
+1. device-arrival events, which report the product ids currently online, and
+2. the receiver's per-slot pairing register, which lists every paired device
+   even if it is asleep.
+
+`probe_direct` handles BT/wired devices and carries a **phantom-device guard**:
+a candidate is only accepted as a real mouse if it answers for a battery *or* a
+control feature (`PERIPHERAL_FEATURE_IDS` = `0x2201` / `0x2202` / `0x1b04`).
+This stops a Bolt receiver's secondary HID interface from being mistaken for a
+mouse — **do not remove it.** (`MAX_BOLT_SLOTS = 6`; arrival events are
+drained for ~1500 ms.)
+
+### 3.5 Write (`write.rs`)
+
+`set_dpi` and `toggle_smartshift` resolve a route to a channel (via
+`with_route`/`open_route_channel`), open the feature, and issue the write.
+**DPI writes read back and verify:** a mismatch logs a warning but still
+returns `Ok`, because the request did reach the device. `SharedChannel` lets
+the capture session reuse one open channel instead of paying the channel-open
+cost per write.
+
+### 3.6 Capture (`gesture.rs`)
+
+`run_capture_session` is the long-lived session behind gestures and remapped
+buttons. It holds **one** channel open, diverts the gesture button (raw-XY),
+the DPI/ModeShift buttons, and — only when its click is bound — the thumb
+wheel, then runs a single message listener that decodes events into
+`CapturedInput` (gesture, button press, scroll). A swipe is committed once the
+hold passes the ~160 ms gate (`GESTURE_HOLD_FOR_SWIPE`), mid-swipe. On shutdown
+it restores every diverted control to its native behaviour.
