@@ -57,8 +57,9 @@ those lints fails the build.
 
 `unsafe` is denied workspace-wide via `unsafe_code = "deny"`
 (`workspace.lints.rust`). Because the level is `deny` (not `forbid`), the
-three modules that genuinely need FFI opt in locally with
-`#[expect(unsafe_code, reason = "…")]`:
+three modules that genuinely need FFI opt back in locally — via an
+`#[expect]`/`#[allow(unsafe_code, reason = "…")]` attribute or a crate-wide
+`unsafe_code = "allow"`:
 
 - `openlogi-hook` (`src/macos.rs`) — `CGEventTap` / `CFRunLoop` /
   Accessibility FFI; opts in crate-wide via `unsafe_code = "allow"` in its
