@@ -62,4 +62,4 @@ The serializable data model and all device-agnostic logic.
 - **Paths (`paths.rs`):** XDG base directories on every OS; the config file
   lives at `~/.config/openlogi/config.toml`.
 
-See [Configuration](CONFIGURATION.md) for the on-disk file format.
+See [`CONFIGURATION.md`](CONFIGURATION.md) for the on-disk file format.
