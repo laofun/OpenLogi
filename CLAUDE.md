@@ -71,3 +71,43 @@ three modules that genuinely need FFI opt back in locally — via an
 Every opt-in carries a `reason`, and each `unsafe` block carries a
 `// SAFETY:` comment justifying it. Logging goes through the `tracing` crate;
 the level is set by the `OPENLOGI_LOG` env filter (default `info`).
+
+## 5. Critical gotchas
+
+The non-obvious traps. Details and code references in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+- **`hidpp 0.2`'s feature registry is empty for our features.** Resolve a
+  feature via `device.root().get_feature(ID)` + `device.add_feature::<F>()`,
+  **not** `enumerate_features()` (its `versions: &[]` means a typed
+  `get_feature::<F>()` returns `None`). Applies to `0x2201`, `0x2111`,
+  `0x1b04`, `0x2150`. See `write::open_feature`.
+- **SmartShift `0x2111` function IDs are shifted** vs the older `0x2110`:
+  getStatus = function `1`, setStatus = function `2`. Using `0x2110`'s IDs
+  silently no-ops the device.
+- **Directly-attached devices are addressed at index `0xff`**
+  (`DIRECT_DEVICE_INDEX`). `probe_direct`'s phantom-device guard (requires a
+  battery *or* a control feature) keeps a Bolt receiver's secondary interface
+  from being mistaken for a mouse — **don't remove it.**
+- **`Action::execute` has no automated test** (it would have to intercept the
+  OS event queue). Smoke-test it manually.
+- **DPI writes read back and verify**; a mismatch logs a warning but still
+  returns `Ok` (the request reached the device).
+- **A few actions are stubs** — some media keys log their intended NX key
+  instead of posting it.
+- **The hook callback runs on a background thread**, not the GPUI thread, and
+  must return quickly — blocking it stalls system-wide input.
+
+## 6. Stability contracts
+
+The variant *names* of `Action`, `ButtonId`, and `GestureDirection` are the
+on-disk `config.toml` schema (serde external tagging). Appending new variants
+is safe; renaming or removing one is a migration event that requires bumping
+`Config::SCHEMA_VERSION`.
+
+## 7. Pointers
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — detailed architecture and the HID++ flow.
+- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — full dev workflow + packaging.
+- [`docs/USAGE.md`](docs/USAGE.md) — the CLI reference.
+- [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — the config file format.
