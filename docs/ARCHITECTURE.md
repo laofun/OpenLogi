@@ -226,3 +226,30 @@ The GPUI + gpui-component desktop app (the `openlogi-gui` binary).
 Other module groups under `src/` organise the views and platform glue
 (`state/`, `mouse_model/`, `components/`, `platform/`, `asset/`, `windows/`).
 User-facing strings go through the `tr!` i18n macro.
+
+## 8. End-to-end flows
+
+Three walkthroughs that cross crate boundaries.
+
+**Startup & inventory.** On launch the GUI gathers the HID++ inventory
+**synchronously on the main thread** (GPUI owns the main thread, so the
+blocking `enumerate_blocking` call cannot move onto a tokio runtime):
+`openlogi-hid::enumerate` merges Bolt arrival events, the per-slot pairing
+register, and direct probes. It then builds the device list and resolves each
+device's assets (`openlogi-assets`) and current DPI / SmartShift state,
+populating `AppState`. A separate 2-second watcher thread re-enumerates
+afterwards for hot-plug.
+
+**Side-button press → remap.** The `CGEventTap` in `openlogi-hook` fires its
+callback on the tap thread → `hook_runtime` looks up the binding for that
+button in its mirrored map → for a remapped button it runs `Action::execute`
+(`openlogi-core`) to synthesise the replacement event and returns `Suppress`;
+for an unbound or primary left/right button it returns `PassThrough` and the OS
+delivers the original event.
+
+**DPI change → device write.** Changing DPI in the GUI calls
+`openlogi-hid`'s `write::set_dpi` (by route) or `set_dpi_on` (by
+`SharedChannel`) on a background task, which opens the AdjustableDpi feature
+(`0x2201`), writes the new value, then reads it back to verify — logging a
+warning on mismatch but reporting success because the request reached the
+device.
