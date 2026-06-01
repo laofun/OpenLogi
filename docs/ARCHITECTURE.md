@@ -201,3 +201,28 @@ bulk `assets sync` at packaging time, and the GUI's per-device fetch at startup.
   (`features`, `dpi`).
 
 See [`USAGE.md`](USAGE.md) for the full CLI reference.
+
+## 7. openlogi-gui
+
+The GPUI + gpui-component desktop app (the `openlogi-gui` binary).
+
+- **`AppState` (`state.rs`)** is a GPUI global holding cross-view state: the
+  current device, its bindings, DPI, and Accessibility status.
+- **`hook_runtime.rs`** is the runtime bridge between background input events
+  and actions. It mirrors the binding map out of `AppState`, installs the OS
+  hook lazily, and dispatches both hook events and gesture events. The standard
+  buttons Middle / Back / Forward are remapped; the primary left / right clicks
+  always pass through, as does any button left on its own native click. Gesture
+  buttons never reach the tap — the gesture watcher captures them over HID++.
+- **Device-side actions** (DPI cycle, SmartShift) are routed to background HID
+  writes (`write_dpi_in_background` / `toggle_smartshift_in_background`) so the
+  event callback never blocks. Those writes take a `CaptureChannel` and reuse
+  the capture session's open channel (a `SharedChannel`) rather than opening a
+  new one per write.
+- **Watchers (`watchers/`)** are the polling/event tasks: `accessibility`,
+  `foreground_app` (drives the per-app overlay, polling at ~1 Hz), `gesture`,
+  `inventory`, and `pairing`.
+
+Other module groups under `src/` organise the views and platform glue
+(`state/`, `mouse_model/`, `components/`, `platform/`, `asset/`, `windows/`).
+User-facing strings go through the `tr!` i18n macro.
