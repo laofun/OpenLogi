@@ -162,3 +162,20 @@ wheel, then runs a single message listener that decodes events into
 mid-gesture, as soon as the hold passes the ~160 ms gate
 (`GESTURE_HOLD_FOR_SWIPE`). On shutdown it restores every diverted control to
 its native behaviour.
+
+## 4. openlogi-hook
+
+The system input hook. On macOS it installs a `CGEventTap` on a dedicated
+`CFRunLoop` thread and exposes `Hook::start` / `Hook::stop`, the Accessibility
+helpers `has_accessibility` / `prompt_accessibility`, and `frontmost_bundle_id`
+for the per-app overlay. Each event surfaces as a `MouseEvent`, and the
+callback returns an `EventDisposition` — `PassThrough` to let the OS deliver the
+event, or `Suppress` to swallow it (used when a button is remapped). The tap
+only observes the standard buttons 0–4.
+
+**The callback runs on the tap's background thread**, not the GPUI main thread,
+and must return quickly — blocking it stalls system-wide input.
+
+On non-macOS targets `Hook` is uninhabited (an `Infallible` field), so it can
+never be constructed and `start` only ever returns `HookError::Unsupported`.
+The crate still compiles cleanly on every target.
