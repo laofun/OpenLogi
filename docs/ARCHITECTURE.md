@@ -94,3 +94,34 @@ both the write path and the capture session go through it. For a direct route
 it pre-filters candidates on vendor/product id before paying the ~100 ms
 channel-open cost — otherwise, on a host that also has a Bolt receiver, every
 direct write would needlessly open the receiver's channel first.
+
+### 3.3 Feature wrappers — and the `hidpp 0.2` registry workaround
+
+`hidpp 0.2` ships no typed wrappers for the features OpenLogi drives, so each is
+re-implemented here:
+
+| Feature | ID | File | Purpose |
+|---|---|---|---|
+| AdjustableDpi | `0x2201` | `adjustable_dpi.rs` | read/set sensor DPI |
+| SmartShift Enhanced | `0x2111` | `smartshift.rs` | ratchet ↔ free-spin |
+| ReprogControlsV4 | `0x1b04` | `reprog_controls.rs` | divert + decode buttons |
+| Thumbwheel | `0x2150` | `thumbwheel.rs` | divert the MX thumb wheel |
+
+**The feature-resolution workaround (critical).** `hidpp 0.2`'s central feature
+registry is effectively empty for these IDs, so a `get_feature::<F>()` keyed by
+the wrapper's `TypeId` returns `None`. `write::open_feature` works around this:
+it asks the device's *root* feature for the index of a feature ID
+(`device.root().get_feature(F::ID)`, which returns the assigned index
+unconditionally) and then attaches the typed wrapper to that index with
+`device.add_feature::<F>(info.index)`. It deliberately bypasses
+`enumerate_features()`. Every self-implemented feature above goes through this
+path.
+
+**Two device-specific traps the wrappers encode:**
+
+- **SmartShift `0x2111` shifts its call table** versus the older `0x2110`:
+  `getStatus` is function `1` and `setStatus` is function `2` (on `0x2110`
+  they are `0` and `1`). Calling `0x2110`'s function IDs against a `0x2111`
+  device hits the wrong functions and the device silently keeps its old state.
+- **AdjustableDpi `0x2201`** uses Short messages: function `0` = getSensorCount,
+  `2` = getSensorDpi, `3` = setSensorDpi.
