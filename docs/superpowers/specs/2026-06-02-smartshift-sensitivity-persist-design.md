@@ -68,9 +68,10 @@ CLI:  diag smartshift --sensitivity N --save
         → save_atomic()                           [~/.config/openlogi/config.toml]
 
 GUI:  inventory refresh (device connects)
-        → smartshift_pending(config, connected_keys, already_applied)
+        → Config::load_or_default()               [fresh read from disk — see Interactions]
+        → smartshift_pending(disk_config, connected_keys, already_applied)
         → for each (config_key, value): apply_smartshift_sensitivity_in_background(route, value)
-        → mark config_key applied; prune disconnected keys
+        → sync value into in-memory AppState.config; mark config_key applied; prune disconnected keys
 ```
 
 ## Components
@@ -182,6 +183,15 @@ fn smartshift_pending(
 
 **State.** `AppState` gains `smartshift_applied: HashSet<String>`.
 
+**Disk is the source of truth.** Auto-apply reads the persisted value from a
+fresh `Config::load_or_default()` (disk), **not** from the in-memory
+`AppState.config`. This avoids the clobber described under *Interactions*: the
+CLI may have written `smartshift_sensitivity` to disk after the GUI loaded its
+in-memory copy, and that stale in-memory copy would otherwise miss it. After
+applying, the value is synced into `AppState.config` via
+`set_smartshift_sensitivity(key, Some(value))` so the GUI's next full-file
+`save_atomic()` preserves it instead of overwriting it.
+
 **Insertion point.** In `main.rs`, the inventory-refresh branch
 (`Some(new_inv) = inventory_rx.recv()`), after
 `state.refresh_inventories(&new_inv, &cache)`:
@@ -190,14 +200,43 @@ fn smartshift_pending(
    records (each record carries `config_key` + `route`).
 2. Prune `smartshift_applied` of keys not in the connected set (so a
    disconnect→reconnect re-applies).
-3. Call `smartshift_pending(...)` to get the pending writes.
-4. For each `(config_key, value)`, look up the device's `route` and call
-   `apply_smartshift_sensitivity_in_background(None, route, value)`, then insert
-   the key into `smartshift_applied`.
+3. Load the config fresh from disk and call `smartshift_pending(...)` to get the
+   pending writes.
+4. For each `(config_key, value)`, look up the device's `route`, call
+   `apply_smartshift_sensitivity_in_background(None, route, value)`, sync the
+   value into `AppState.config`, and insert the key into `smartshift_applied`.
 
 A key is inserted into `smartshift_applied` whether or not the firmware write
 succeeded, so a failing device is not hammered on every poll tick; reconnecting
 clears the key and retries.
+
+## Interactions With Existing Behavior
+
+Assessed against the rest of the codebase before settling the design:
+
+- **GUI config save can clobber the CLI's value (the one real conflict).** The
+  GUI saves config by rewriting the whole file from its in-memory `Config`
+  (`state.rs` — `save_atomic()` on selected-device, dpi-presets, and
+  app-settings changes), and it loads that copy only once at startup. If the CLI
+  writes `smartshift_sensitivity` to disk while the GUI is running, the GUI's
+  stale in-memory copy lacks it, and the next GUI save overwrites the file
+  without it. **Resolved** by making auto-apply read the value fresh from disk
+  and sync it back into `AppState.config` (see component 3). Because every GUI
+  mutation saves immediately, disk is always current with GUI state, so a fresh
+  read is safe.
+- **Manual `Action::ToggleSmartShift` vs auto-apply — no conflict.** The toggle
+  is read-modify-write and preserves sensitivity; auto-apply runs at most once
+  per connection. They share no state beyond the firmware itself, so there is no
+  race.
+- **Writing on a fresh channel while a capture session is open — no conflict.**
+  This is the established pattern: the DPI panel and the SmartShift toggle
+  already perform background writes on a freshly opened channel
+  (`capture = None`) alongside an active capture. Auto-apply uses the same path.
+- **Startup coverage.** Auto-apply hooks the `inventory_rx` refresh branch, so
+  devices present at launch are covered by the watcher's first tick (≤ ~2 s
+  delay). No separate startup path is needed.
+- **Branch dependency.** This branch is based on `feat/smartshift-0x2110` (open
+  PR, not yet merged upstream). If that PR changes, this branch must be rebased.
 
 ## Error Handling
 
@@ -229,6 +268,9 @@ clears the key and retries.
 - **Manual hardware (MX Master 2S):** `--sensitivity N --save`, confirm
   `config.toml` updated; restart GUI / re-pair device, confirm the value is
   re-applied (read back via `diag smartshift`).
+- **Manual clobber check:** with the GUI running, run `--sensitivity N --save`,
+  then change a setting in the GUI (forcing a `save_atomic()`), and confirm
+  `smartshift_sensitivity` survives in `config.toml`.
 
 ## Documentation Constraints
 
