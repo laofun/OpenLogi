@@ -2,8 +2,16 @@
 //! such as MX Master 2S that do not expose `0x1004 UnifiedBattery`.
 //!
 //! Only `getStatus` (function 0) is implemented; notification decoding is not
-//! needed for the inventory probe. Payload format cross-checked against the
-//! Linux kernel `hid-logitech-hidpp.c` (`hidpp20_battery_set_battery_state`).
+//! needed for the inventory probe.
+//!
+//! Response format (function 0, `getBatteryLevelStatus`), cross-checked against
+//! Solaar's `hidpp20.decipher_battery_status`:
+//!
+//! - `params[0]` — current battery charge as a percentage (`0..=100`).
+//! - `params[1]` — next discharge-level threshold (informational; ignored).
+//! - `params[2]` — battery status enum (same values as `0x1004`):
+//!   `0` discharging, `1` recharging, `2` almost-full, `3` full,
+//!   `4` slow-recharge, `5` invalid battery, `6` thermal error.
 
 use std::sync::Arc;
 
@@ -20,10 +28,10 @@ pub const FEATURE_ID: u16 = 0x1000;
 /// Raw `getStatus` response decoded from `0x1000`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatteryStatusInfo {
-    /// Battery charge percentage (0–100). May be a coarse approximation.
+    /// Battery charge percentage (`0..=100`).
     pub percentage: u8,
-    /// Next battery level estimate (firmware field; often same as current).
-    pub next_percentage: u8,
+    /// Next discharge-level threshold (firmware field; informational only).
+    pub next_threshold: u8,
     /// Charging/discharging state.
     pub status: BatteryStatus,
 }
@@ -61,64 +69,42 @@ impl BatteryStatusFeature {
             ))
             .await?;
         let p = response.extend_payload();
-        // p[0] = discharge level (0–7 levels) documented as percentage proxy
-        // p[1] = next level
-        // p[2] = status byte (charging state)
-        let percentage = decode_discharge_level(p[0]);
-        let next_percentage = decode_discharge_level(p[1]);
-        let status = decode_status_byte(p[2]);
         Ok(BatteryStatusInfo {
-            percentage,
-            next_percentage,
-            status,
+            percentage: p[0],
+            next_threshold: p[1],
+            status: decode_status(p[2]),
         })
     }
 
     /// Convenience: return a [`BatteryInfo`] suitable for the inventory layer.
     pub async fn get_battery_info(&self) -> Result<BatteryInfo, Hidpp20Error> {
         let raw = self.get_status().await?;
-        let level = percentage_to_level(raw.percentage);
         Ok(BatteryInfo {
             percentage: raw.percentage,
-            level,
+            level: percentage_to_level(raw.percentage),
             status: raw.status,
         })
     }
 }
 
-/// The `0x1000` `dischargeLevel` field encodes approximate % in 7 steps.
-/// Mapping cross-checked against Linux kernel `hid-logitech-hidpp.c`
-/// (`hidpp20_battery_set_battery_state`, cases 0–7).
-fn decode_discharge_level(level: u8) -> u8 {
-    match level {
-        1 => 10,
-        2 => 30,
-        3 => 50,
-        4 => 70,
-        5 => 90,
-        6 | 7 => 100,
-        _ => 0,
+/// Decode the `0x1000` status enum byte (`params[2]`) into the core
+/// [`BatteryStatus`]. Values match the `0x1004 UnifiedBattery` enum.
+fn decode_status(byte: u8) -> BatteryStatus {
+    match byte {
+        0 => BatteryStatus::Discharging,
+        1 => BatteryStatus::Charging,
+        // 2 = almost-full, 3 = full → both surface as "full" in core's coarser enum.
+        2 | 3 => BatteryStatus::Full,
+        4 => BatteryStatus::ChargingSlow,
+        // 5 = invalid battery, 6 = thermal error.
+        5 | 6 => BatteryStatus::Error,
+        _ => BatteryStatus::Unknown,
     }
 }
 
-/// `statusBit` byte from `0x1000 getStatus` response.
-/// bit 0 = discharging, bit 1 = recharging, bit 2 = charge complete, bit 3 = error.
-/// Cross-checked against Linux kernel `hidpp20_battery_set_battery_state`.
-fn decode_status_byte(byte: u8) -> BatteryStatus {
-    if byte & 0x08 != 0 {
-        return BatteryStatus::Error;
-    }
-    if byte & 0x04 != 0 {
-        return BatteryStatus::Full;
-    }
-    if byte & 0x02 != 0 {
-        return BatteryStatus::Charging;
-    }
-    BatteryStatus::Discharging
-}
-
+/// Bucket a percentage into the coarse [`BatteryLevel`] the UI shows.
 fn percentage_to_level(pct: u8) -> BatteryLevel {
-    if pct == 0 {
+    if pct <= 10 {
         BatteryLevel::Critical
     } else if pct <= 20 {
         BatteryLevel::Low
@@ -131,44 +117,51 @@ fn percentage_to_level(pct: u8) -> BatteryLevel {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_discharge_level, decode_status_byte, percentage_to_level};
+    use super::{decode_status, percentage_to_level};
     use openlogi_core::device::{BatteryLevel, BatteryStatus};
 
     #[test]
-    fn discharge_level_maps_to_percentage() {
-        assert_eq!(decode_discharge_level(0), 0);
-        assert_eq!(decode_discharge_level(1), 10);
-        assert_eq!(decode_discharge_level(4), 70);
-        assert_eq!(decode_discharge_level(6), 100);
-        assert_eq!(decode_discharge_level(7), 100);
+    fn status_enum_discharging() {
+        assert_eq!(decode_status(0), BatteryStatus::Discharging);
     }
 
     #[test]
-    fn status_byte_discharging() {
-        assert_eq!(decode_status_byte(0x00), BatteryStatus::Discharging);
-        assert_eq!(decode_status_byte(0x01), BatteryStatus::Discharging);
+    fn status_enum_charging() {
+        assert_eq!(decode_status(1), BatteryStatus::Charging);
     }
 
     #[test]
-    fn status_byte_charging() {
-        assert_eq!(decode_status_byte(0x02), BatteryStatus::Charging);
+    fn status_enum_almost_full_and_full_map_to_full() {
+        assert_eq!(decode_status(2), BatteryStatus::Full);
+        assert_eq!(decode_status(3), BatteryStatus::Full);
     }
 
     #[test]
-    fn status_byte_full() {
-        assert_eq!(decode_status_byte(0x04), BatteryStatus::Full);
+    fn status_enum_slow_recharge() {
+        assert_eq!(decode_status(4), BatteryStatus::ChargingSlow);
     }
 
     #[test]
-    fn status_byte_error() {
-        assert_eq!(decode_status_byte(0x08), BatteryStatus::Error);
+    fn status_enum_errors() {
+        assert_eq!(decode_status(5), BatteryStatus::Error);
+        assert_eq!(decode_status(6), BatteryStatus::Error);
+    }
+
+    #[test]
+    fn status_enum_unknown() {
+        assert_eq!(decode_status(7), BatteryStatus::Unknown);
+        assert_eq!(decode_status(0xff), BatteryStatus::Unknown);
     }
 
     #[test]
     fn percentage_to_level_boundaries() {
         assert_eq!(percentage_to_level(0), BatteryLevel::Critical);
-        assert_eq!(percentage_to_level(10), BatteryLevel::Low);
+        assert_eq!(percentage_to_level(10), BatteryLevel::Critical);
+        assert_eq!(percentage_to_level(15), BatteryLevel::Low);
+        assert_eq!(percentage_to_level(20), BatteryLevel::Low);
         assert_eq!(percentage_to_level(50), BatteryLevel::Good);
+        assert_eq!(percentage_to_level(89), BatteryLevel::Good);
+        assert_eq!(percentage_to_level(90), BatteryLevel::Full);
         assert_eq!(percentage_to_level(100), BatteryLevel::Full);
     }
 }

@@ -52,14 +52,41 @@ bindings, assets, and auto-apply all refer to the same device section.
 
 ## Battery
 
-OpenLogi's live `openlogi list` output shows `battery=—` for MX Master 2S despite the
-external descriptor marking battery support. The inventory layer currently reads only
-HID++ `0x1004 UnifiedBattery`; if the device exposes `0x1000 BatteryStatus` or
-`0x1001 BatteryVoltage` instead, no battery value is produced.
+Hardware-confirmed: MX Master 2S exposes **`0x1000 BatteryStatus`** (legacy), not
+`0x1004 UnifiedBattery` and not `0x1001 BatteryVoltage`. The original `battery=—` in
+`openlogi list` was because the inventory layer only read `0x1004`.
 
-Run `openlogi diag battery` on hardware to determine which battery feature IDs the device
-actually exposes. Decoder support for `0x1000` / `0x1001` is deferred until the feature
-presence and payload shape are confirmed on-device.
+`openlogi diag battery` output on the device:
+
+```text
+0x1000 BatteryStatus:  present
+0x1001 BatteryVoltage: not found
+0x1004 UnifiedBattery: not found
+```
+
+### `0x1000` getStatus (function 0) wire format
+
+Cross-checked against Solaar's `hidpp20.decipher_battery_status` (and the
+`logitune` C++ port `Battery::parseStatusLegacy`, GPL-3.0 — referenced for
+protocol facts only, no code copied):
+
+```text
+params[0] = current battery charge percentage (0..=100); 0 = unknown
+params[1] = next discharge-level threshold (informational; ignored)
+params[2] = status enum (same values as 0x1004 UnifiedBattery):
+            0 discharging, 1 recharging, 2 almost-full, 3 full,
+            4 slow-recharge, 5 invalid battery, 6 thermal error
+```
+
+Implementation notes:
+
+- The function ID for legacy `0x1000` getStatus is **0** (the shifted IDs only apply
+  to `0x2111` SmartShift, not battery features).
+- `params[0] == 0` means **unknown**, not a literal 0%. Inventory and `diag battery`
+  treat a zero reading as "no battery info" rather than surfacing a bogus
+  `0% critical`. A degraded just-woken read (all-zero `model_ids` / `unit_id` /
+  `transports`) also produces `params[0] == 0`, so this guard covers both cases.
+- See `crates/openlogi-hid/src/battery_status.rs`.
 
 ## Feature matrix
 

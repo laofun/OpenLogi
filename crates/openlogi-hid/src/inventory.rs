@@ -429,6 +429,15 @@ async fn probe_legacy_battery(
         .ok()??;
     let feature = BatteryStatusFeature::new(Arc::clone(channel), slot, info.index);
     match feature.get_battery_info().await {
+        // `0x1000` reports percentage 0 as "unknown" (firmware not ready, or a
+        // degraded just-woken read). Don't surface a bogus 0%/critical reading.
+        Ok(b) if b.percentage == 0 => {
+            debug!(
+                slot,
+                "BatteryStatus (0x1000) returned 0% — treating as unknown"
+            );
+            None
+        }
         Ok(b) => Some(b),
         Err(e) => {
             debug!(slot, error = ?e, "BatteryStatus (0x1000) read failed");
