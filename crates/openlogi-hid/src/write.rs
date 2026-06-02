@@ -107,6 +107,18 @@ async fn open_feature<F: CreatableFeature + 'static>(
     Ok(device.add_feature::<F>(info.index))
 }
 
+/// Whether a failure to open the `0x2111` Enhanced SmartShift feature should
+/// trigger the `0x2110` legacy fallback. Only a missing-`0x2111` feature
+/// qualifies; transport and protocol errors propagate unchanged so a real
+/// failure is never masked by a second open attempt.
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_missing_enhanced(err: &WriteError) -> bool {
+    matches!(
+        err,
+        WriteError::FeatureUnsupported { feature_hex } if *feature_hex == 0x2111
+    )
+}
+
 /// Map the fork's `0x2110` [`WheelMode`] onto OpenLogi's [`SmartShiftMode`].
 /// A reserved/future variant maps to [`SmartShiftMode::Ratchet`], the "safe"
 /// clicky default OpenLogi uses elsewhere.
@@ -314,5 +326,30 @@ mod tests {
             wheel_mode_to_smartshift(WheelMode::Ratchet),
             SmartShiftMode::Ratchet
         );
+    }
+
+    #[test]
+    fn missing_enhanced_triggers_fallback() {
+        assert!(is_missing_enhanced(&WriteError::FeatureUnsupported {
+            feature_hex: 0x2111,
+        }));
+    }
+
+    #[test]
+    fn missing_legacy_does_not_trigger_fallback() {
+        // A device missing 0x2110 must NOT loop back — it genuinely has no
+        // SmartShift.
+        assert!(!is_missing_enhanced(&WriteError::FeatureUnsupported {
+            feature_hex: 0x2110,
+        }));
+    }
+
+    #[test]
+    fn transport_errors_do_not_trigger_fallback() {
+        // Real failures must propagate, not be masked by a fallback attempt.
+        assert!(!is_missing_enhanced(&WriteError::DeviceUnreachable {
+            index: 0xff,
+        }));
+        assert!(!is_missing_enhanced(&WriteError::Hidpp("boom".into())));
     }
 }
