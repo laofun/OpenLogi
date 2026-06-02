@@ -12,8 +12,10 @@ pub struct SmartshiftArgs {
     #[arg(long, conflicts_with = "sensitivity")]
     pub leave_flipped: bool,
 
-    /// Set the auto-disengage sensitivity (1-255; 255 = permanent ratchet)
-    /// instead of toggling. Keeps the current Free/Ratchet mode.
+    /// Set the auto-disengage sensitivity instead of toggling, keeping the
+    /// current Free/Ratchet mode. N is 1-255 (the wheel's speed threshold to
+    /// free-spin): lower = more sensitive; typical 10-40; 255 = permanent
+    /// ratchet.
     #[arg(long, value_name = "N")]
     pub sensitivity: Option<u8>,
 }
