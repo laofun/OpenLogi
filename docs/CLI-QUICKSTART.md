@@ -122,3 +122,46 @@ OPENLOGI_LOG=debug cargo run -p openlogi --release -- list
 
 Accepts the standard `tracing` levels: `error`, `warn`, `info`, `debug`,
 `trace`.
+
+## 6. Configuration & scope (what the CLI does *not* do)
+
+The CLI is a **diagnostic / inventory / asset** tool. It has **no
+configuration commands** — there is no `openlogi config …` and no way to define
+or apply button bindings, gestures, or per-app profiles from the CLI.
+
+What the CLI *can* change on a device, it writes straight to the mouse's
+firmware, so the change survives with no software running:
+
+- `diag dpi --target N` writes a DPI value (then restores it — it is a test).
+- `diag smartshift` toggles the mode (restores unless `--leave-flipped`).
+- `diag smartshift --sensitivity N` writes the SmartShift sensitivity and
+  **keeps it** (the one CLI command that makes a lasting change).
+
+Everything else — mapping a button to an action, gestures, profiles that switch
+by frontmost app — lives in `config.toml` at **`~/.config/openlogi/`**
+(see [`CONFIGURATION.md`](CONFIGURATION.md) for the format). That file is read
+and applied **only by the desktop app** (`openlogi-gui`): the macOS event hook,
+the gesture/foreground-app watchers, and binding application all live in the GUI
+crate. The login `LaunchAgent` simply starts the same `openlogi-gui` binary —
+there is no separate headless daemon.
+
+**Consequence:** button/gesture bindings do **not** work without `openlogi-gui`
+running (it can run hidden in the menu bar, but the process must be alive).
+Editing `config.toml` by hand has no effect unless the GUI is running to consume
+it. The CLI alone covers DPI and SmartShift only.
+
+### Building the GUI requires full Xcode
+
+`openlogi-gui` uses GPUI, whose `gpui_macos` build script invokes Apple's
+`metal` shader compiler. That compiler ships only with the **Metal Toolchain**
+component of full **Xcode 16+** — it is *not* part of the Command Line Tools, so
+a CLT-only machine cannot build the GUI (it fails with
+`xcrun: error: unable to find utility "metal"`). There is no supported way to
+build the GUI without Xcode. If you only have the Command Line Tools, your
+options are:
+
+- Install full Xcode 16+ (and its Metal Toolchain component), or
+- build the GUI on another machine / CI that has Xcode, or
+- install a prebuilt `OpenLogi.app` release instead of building it.
+
+The **CLI builds fine with the Command Line Tools alone** — see §1.
