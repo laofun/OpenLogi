@@ -195,6 +195,30 @@ impl SmartShift {
             }
         }
     }
+
+    /// Write a new auto-disengage `sensitivity`, preserving the current mode.
+    /// Reads the current mode first, then writes it back together with the new
+    /// sensitivity — both arms write the mode explicitly, so we never rely on
+    /// the device treating a `None` wheel-mode as "keep current".
+    async fn set_sensitivity(&self, value: u8) -> Result<(), WriteError> {
+        let SmartShiftStatus { mode, .. } = self.status().await?;
+        match self {
+            Self::Enhanced(feature) => feature
+                .set_status(mode, value)
+                .await
+                .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
+            Self::Legacy(feature) => {
+                let wheel = match mode {
+                    SmartShiftMode::Free => WheelMode::Freespin,
+                    SmartShiftMode::Ratchet => WheelMode::Ratchet,
+                };
+                feature
+                    .set_ratchet_control_mode(Some(wheel), Some(value), None)
+                    .await
+                    .map_err(|e| WriteError::Hidpp(format!("{e:?}")))
+            }
+        }
+    }
 }
 
 /// Read the device's current DPI on sensor 0 — companion to [`set_dpi`].
@@ -224,6 +248,32 @@ pub async fn get_smartshift_status(route: &DeviceRoute) -> Result<SmartShiftStat
             .await
             .map_err(|_| WriteError::DeviceUnreachable { index })?;
         let smartshift = SmartShift::open(&mut device).await?;
+        smartshift.status().await
+    })
+    .await
+}
+
+/// Set the SmartShift auto-disengage sensitivity on `route`, preserving the
+/// current mode. Returns the read-back status after the write so the caller can
+/// display and verify it.
+///
+/// `value` is written verbatim: `0x01..=0xfe` is the auto-disengage threshold
+/// (smaller = releases sooner / more sensitive) and `0xff` is permanent ratchet.
+/// Callers should reject `0`, which the device treats as "no change".
+///
+/// `FeatureUnsupported` when the device exposes neither HID++ `0x2111`
+/// (MX Master 3 / 3S) nor the older `0x2110` (MX Master 2S).
+pub async fn set_smartshift_sensitivity(
+    route: &DeviceRoute,
+    value: u8,
+) -> Result<SmartShiftStatus, WriteError> {
+    let index = route.device_index();
+    with_route(route, move |channel| async move {
+        let mut device = Device::new(Arc::clone(&channel), index)
+            .await
+            .map_err(|_| WriteError::DeviceUnreachable { index })?;
+        let smartshift = SmartShift::open(&mut device).await?;
+        smartshift.set_sensitivity(value).await?;
         smartshift.status().await
     })
     .await
