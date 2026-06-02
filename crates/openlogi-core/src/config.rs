@@ -566,10 +566,7 @@ mod tests {
         cfg.set_smartshift_sensitivity("2b042", Some(42));
 
         let body = toml::to_string_pretty(&cfg).expect("serialize");
-        assert!(
-            body.contains("smartshift_sensitivity = 42"),
-            "got: {body}"
-        );
+        assert!(body.contains("smartshift_sensitivity = 42"), "got: {body}");
     }
 
     #[test]

@@ -98,7 +98,10 @@ pub fn apply_smartshift_sensitivity_in_background(
     value: u8,
 ) {
     let Some(target) = target else {
-        debug!(value, "no target device — SmartShift sensitivity apply skipped");
+        debug!(
+            value,
+            "no target device — SmartShift sensitivity apply skipped"
+        );
         return;
     };
     // Auto-apply opens a fresh channel (capture = None / non-matching is fine);
