@@ -48,9 +48,9 @@ pub(crate) async fn first_online_device() -> Result<(DeviceRoute, String, String
         .into_iter()
         .find_map(|inv| {
             let paired = inv.paired.into_iter().find(|p| p.online)?;
-            let route = match inv.receiver.unique_id {
+            let route = match &inv.receiver.unique_id {
                 Some(receiver_uid) => DeviceRoute::Bolt {
-                    receiver_uid,
+                    receiver_uid: receiver_uid.clone(),
                     slot: paired.slot,
                 },
                 None => DeviceRoute::Direct {
@@ -62,6 +62,13 @@ pub(crate) async fn first_online_device() -> Result<(DeviceRoute, String, String
                 .model_info
                 .as_ref()
                 .map(openlogi_core::device::DeviceModelInfo::config_key)
+                .filter(|key| key != "00000")
+                .or_else(|| {
+                    inv.receiver
+                        .unique_id
+                        .is_none()
+                        .then(|| format!("0{:04x}", inv.receiver.product_id))
+                })
                 .unwrap_or_default();
             let name = paired
                 .codename

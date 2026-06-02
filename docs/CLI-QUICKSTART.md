@@ -96,12 +96,24 @@ cargo run -p openlogi --release -- diag smartshift --leave-flipped
 # N = 1-255: lower = more sensitive (the wheel free-spins at a lower speed);
 # typical 10-40; 255 = permanent ratchet.
 cargo run -p openlogi --release -- diag smartshift --sensitivity 25
+
+# Set the sensitivity AND persist it to config.toml, so the GUI re-applies it
+# every time this device connects (survives sleep / re-pairing):
+cargo run -p openlogi --release -- diag smartshift --sensitivity 25 --save
 ```
 
 `--sensitivity` and `--leave-flipped` are mutually exclusive. `--sensitivity 0`
 is rejected because the device treats `0` as "no change". Works on both the
 `0x2111` Enhanced (MX Master 3 / 3S) and the original `0x2110` (MX Master 2S)
 SmartShift features.
+
+`--save` requires `--sensitivity` and is the only CLI option that writes to
+`config.toml`. After the firmware write is read-back-verified, it stores the
+value under the device's model key, so the desktop app (`openlogi-gui`)
+re-applies it on every connect — see §6. The firmware write itself is immediate
+and standalone; the persisted value only drives auto-apply while the GUI is
+running. `--save` fails if the device did not report a model id (HID++
+`0x0003`), since that id is the config key.
 
 ### `assets sync` — fetch device render assets
 
@@ -125,9 +137,10 @@ Accepts the standard `tracing` levels: `error`, `warn`, `info`, `debug`,
 
 ## 6. Configuration & scope (what the CLI does *not* do)
 
-The CLI is a **diagnostic / inventory / asset** tool. It has **no
+The CLI is a **diagnostic / inventory / asset** tool. It has almost **no
 configuration commands** — there is no `openlogi config …` and no way to define
-or apply button bindings, gestures, or per-app profiles from the CLI.
+or apply button bindings, gestures, or per-app profiles from the CLI. The lone
+exception is `diag smartshift --save` (below).
 
 What the CLI *can* change on a device, it writes straight to the mouse's
 firmware, so the change survives with no software running:
@@ -135,7 +148,15 @@ firmware, so the change survives with no software running:
 - `diag dpi --target N` writes a DPI value (then restores it — it is a test).
 - `diag smartshift` toggles the mode (restores unless `--leave-flipped`).
 - `diag smartshift --sensitivity N` writes the SmartShift sensitivity and
-  **keeps it** (the one CLI command that makes a lasting change).
+  **keeps it** (the one CLI command that makes a lasting firmware change).
+
+`diag smartshift --sensitivity N --save` additionally writes that value to
+`config.toml` (the only CLI path that touches the config file). It is keyed by
+the device's model id, and the desktop app re-applies it whenever the device
+connects — so the setting is restored after the device sleeps or re-pairs and
+loses it. Firmware writes alone are not re-applied; persisting via `--save` is
+what makes the sensitivity stick across reconnects. As with all config, this
+auto-apply happens **only while `openlogi-gui` is running**.
 
 Everything else — mapping a button to an action, gestures, profiles that switch
 by frontmost app — lives in `config.toml` at **`~/.config/openlogi/`**

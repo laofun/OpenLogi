@@ -201,18 +201,27 @@ impl SmartShift {
     }
 
     /// Write a new auto-disengage `sensitivity`, preserving the current mode.
-    /// Reads the current mode first, then writes it back together with the new
-    /// sensitivity — both arms write the mode explicitly, so we never rely on
-    /// the device treating a `None` wheel-mode as "keep current".
+    ///
+    /// The two features keep the mode differently:
+    /// - `0x2111` (Enhanced) `set_status` has no "keep current" sentinel — it
+    ///   always takes a mode — so we read the current mode and write it back
+    ///   alongside the new threshold.
+    /// - `0x2110` (Legacy) `set_ratchet_control_mode` treats `wheel_mode = None`
+    ///   as "leave unchanged" (the fork's documented contract), so we pass
+    ///   `None` and touch only the threshold. Re-writing a just-read mode there
+    ///   risks persisting a stale / misread value back to the device — on the
+    ///   MX Master 2S that flipped Ratchet → Free.
     async fn set_sensitivity(&self, value: u8) -> Result<(), WriteError> {
-        let SmartShiftStatus { mode, .. } = self.status().await?;
         match self {
-            Self::Enhanced(feature) => feature
-                .set_status(mode, value)
-                .await
-                .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
+            Self::Enhanced(feature) => {
+                let SmartShiftStatus { mode, .. } = self.status().await?;
+                feature
+                    .set_status(mode, value)
+                    .await
+                    .map_err(|e| WriteError::Hidpp(format!("{e:?}")))
+            }
             Self::Legacy(feature) => feature
-                .set_ratchet_control_mode(Some(smartshift_to_wheel(mode)), Some(value), None)
+                .set_ratchet_control_mode(None, Some(value), None)
                 .await
                 .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
         }
