@@ -83,6 +83,64 @@ pub fn toggle_smartshift_in_background(
     });
 }
 
+/// Spawn an OS thread that writes a persisted SmartShift auto-disengage
+/// `value` (1–255) to the device at `target` via
+/// `openlogi_hid::set_smartshift_sensitivity`, preserving the current mode.
+/// Used by the GUI auto-apply path when a device connects. Returns
+/// immediately; failures (incl. devices exposing neither `0x2111` nor the
+/// older `0x2110` SmartShift feature) are logged, never retried within the
+/// call.
+///
+/// `target == None` is a no-op (dev environment without a real device).
+pub fn apply_smartshift_sensitivity_in_background(
+    capture: Option<&CaptureChannel>,
+    target: Option<DeviceRoute>,
+    value: u8,
+) {
+    let Some(target) = target else {
+        debug!(value, "no target device — SmartShift sensitivity apply skipped");
+        return;
+    };
+    // Auto-apply opens a fresh channel (capture = None / non-matching is fine);
+    // the read here keeps the call shape identical to the toggle/DPI writers.
+    let shared = reusable_channel(capture, &target);
+    let reused = shared.is_some();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                warn!(error = %e, "tokio runtime init failed; SmartShift sensitivity apply skipped");
+                return;
+            }
+        };
+        let result = rt.block_on(async {
+            tokio::time::timeout(
+                WRITE_BUDGET,
+                openlogi_hid::set_smartshift_sensitivity(&target, value),
+            )
+            .await
+        });
+        let index = target.device_index();
+        match result {
+            Ok(Ok(status)) => debug!(
+                index,
+                value,
+                applied = status.sensitivity,
+                reused,
+                "SmartShift sensitivity applied"
+            ),
+            Ok(Err(e)) => warn!(error = ?e, "SmartShift sensitivity apply failed"),
+            Err(_) => warn!(
+                index,
+                "SmartShift sensitivity apply timed out (device asleep/unresponsive)"
+            ),
+        }
+    });
+}
+
 /// Spawn an OS thread that writes `dpi` to the device at `target` via
 /// `openlogi_hid::set_dpi`. Returns immediately; failures are logged.
 ///
