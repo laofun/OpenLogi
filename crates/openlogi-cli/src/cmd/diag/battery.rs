@@ -51,13 +51,15 @@ pub async fn run(_args: BatteryArgs) -> Result<()> {
         }
     );
 
-    match summary.unified_battery {
-        Ok(Some(b)) => println!(
-            "    battery: {}% {:?} ({:?})",
-            b.percentage, b.level, b.status
-        ),
-        Ok(None) => println!("    battery: unavailable via 0x1004"),
-        Err(e) => println!("    battery: read failed — {e}"),
+    if summary.unified_battery_present {
+        match summary.unified_battery {
+            Ok(Some(b)) => println!(
+                "    battery: {}% {:?} ({:?})",
+                b.percentage, b.level, b.status
+            ),
+            Ok(None) => println!("    battery: unavailable via 0x1004"),
+            Err(e) => println!("    battery: read failed — {e}"),
+        }
     }
 
     Ok(())
