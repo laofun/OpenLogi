@@ -14,12 +14,13 @@
     reason = "fields are read once their owning component lands in UI.md phases 2–4"
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use gpui::Global;
 use openlogi_core::config::{AppSettings, Config};
 use openlogi_core::device::DeviceInventory;
+use openlogi_hid::DeviceRoute;
 use openlogi_hook::Hook;
 use tracing::{debug, warn};
 
@@ -87,6 +88,12 @@ pub struct AppState {
     /// watcher holds the other `Arc` clone, so writes here reach it without
     /// GPUI involvement.
     pub gesture_hook_bindings: Arc<RwLock<BTreeMap<GestureDirection, Action>>>,
+    /// `config_key`s whose persisted SmartShift sensitivity has already been
+    /// evaluated for the current connection (applied, or determined to need no
+    /// write). Pruned to the connected set on each refresh so a
+    /// disconnect→reconnect re-applies. Prevents per-poll-tick re-writes and
+    /// re-reads of the config file.
+    smartshift_applied: HashSet<String>,
 }
 
 impl AppState {
@@ -146,6 +153,7 @@ impl AppState {
             hook_bindings,
             dpi_cycle,
             gesture_hook_bindings,
+            smartshift_applied: HashSet::new(),
         };
         state.button_bindings = state.bindings_for_current();
         state.gesture_bindings = state.gesture_bindings_for_current();
@@ -209,6 +217,75 @@ impl AppState {
     #[must_use]
     pub fn current_record(&self) -> Option<&DeviceRecord> {
         self.device_list.get(self.current_device)
+    }
+
+    /// Compute and register the SmartShift sensitivities that must be written
+    /// to freshly-connected devices, returning the `(route, value)` pairs the
+    /// caller dispatches to [`crate::hardware::apply_smartshift_sensitivity_in_background`].
+    ///
+    /// Behaviour:
+    /// - **Disk is the source of truth.** Reads the persisted value from a
+    ///   fresh [`Config::load_or_default`] rather than the in-memory copy: the
+    ///   CLI's `--save` may have written it after the GUI loaded its copy.
+    /// - **Apply once per connection.** Every connected `config_key` is marked
+    ///   in `smartshift_applied` after evaluation (whether or not it had a
+    ///   value or the dispatch later succeeds), so a sleeping/failing device is
+    ///   not hammered every poll tick. Pruning the set to the connected keys
+    ///   means a disconnect→reconnect re-applies.
+    /// - **No clobber.** Applied values are synced back into the in-memory
+    ///   `self.config` so the GUI's next full-file `save_atomic()` preserves
+    ///   them instead of overwriting the file without them.
+    /// - **Steady-state cheap.** When every connected key is already evaluated,
+    ///   returns early without touching the disk.
+    ///
+    /// Call this on every inventory refresh, after `refresh_inventories`.
+    pub fn pending_smartshift_writes(&mut self) -> Vec<(DeviceRoute, u8)> {
+        // Connected = online records that carry a route (offline records can't
+        // be written to).
+        let connected: Vec<String> = self
+            .device_list
+            .iter()
+            .filter(|r| r.online && r.route.is_some())
+            .map(|r| r.config_key.clone())
+            .collect();
+
+        // Drop applied keys that are no longer connected so a reconnect retries.
+        self.smartshift_applied
+            .retain(|key| connected.contains(key));
+
+        // Steady state: nothing new connected since last evaluation — skip the
+        // disk read entirely.
+        if connected
+            .iter()
+            .all(|k| self.smartshift_applied.contains(k))
+        {
+            return Vec::new();
+        }
+
+        let disk = Config::load_or_default().unwrap_or_default();
+        let pending = smartshift_pending(&disk, &connected, &self.smartshift_applied);
+
+        let mut writes = Vec::new();
+        for (key, value) in pending {
+            // Sync into the in-memory config so a later full-file save keeps it.
+            self.config.set_smartshift_sensitivity(&key, Some(value));
+            if let Some(route) = self
+                .device_list
+                .iter()
+                .find(|r| r.config_key == key)
+                .and_then(|r| r.route.clone())
+            {
+                writes.push((route, value));
+            }
+        }
+
+        // Mark every connected key evaluated (including no-value devices) so we
+        // don't re-read the config file on every subsequent poll tick.
+        for key in connected {
+            self.smartshift_applied.insert(key);
+        }
+
+        writes
     }
 
     /// Replace [`Self::device_list`] from a fresh inventory snapshot,
@@ -543,3 +620,91 @@ impl AppState {
 }
 
 impl Global for AppState {}
+
+/// Given the persisted config, the `config_key`s currently connected, and the
+/// set already evaluated this session, return the `(config_key, value)` pairs
+/// that still need a firmware write. Skips devices with no persisted value and
+/// any stored `0` (a device no-op). Pure — no I/O, fully unit-testable.
+///
+/// The caller ([`AppState::pending_smartshift_writes`]) is responsible for
+/// pruning `already_applied` of keys no longer connected so a reconnect
+/// re-applies, and for marking keys applied after dispatch.
+fn smartshift_pending(
+    config: &Config,
+    connected: &[String],
+    already_applied: &HashSet<String>,
+) -> Vec<(String, u8)> {
+    connected
+        .iter()
+        .filter(|key| !already_applied.contains(*key))
+        .filter_map(|key| {
+            config
+                .smartshift_sensitivity(key)
+                .filter(|&v| v != 0)
+                .map(|v| (key.clone(), v))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openlogi_core::config::Config;
+    use std::collections::HashSet;
+
+    fn keys(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn pending_returns_persisted_value_on_first_connect() {
+        let mut cfg = Config::default();
+        cfg.set_smartshift_sensitivity("2b042", Some(20));
+        let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &HashSet::new());
+        assert_eq!(pending, vec![("2b042".to_string(), 20)]);
+    }
+
+    #[test]
+    fn pending_skips_already_applied() {
+        let mut cfg = Config::default();
+        cfg.set_smartshift_sensitivity("2b042", Some(20));
+        let applied: HashSet<String> = ["2b042".to_string()].into_iter().collect();
+        let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &applied);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn pending_skips_device_without_value() {
+        let cfg = Config::default(); // no persisted sensitivity for 2b042
+        let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &HashSet::new());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn pending_skips_stored_zero() {
+        let mut cfg = Config::default();
+        cfg.set_smartshift_sensitivity("2b042", Some(0)); // hand-edited no-op
+        let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &HashSet::new());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn pending_reapplies_after_key_pruned_from_applied() {
+        let mut cfg = Config::default();
+        cfg.set_smartshift_sensitivity("2b042", Some(20));
+        // Simulate a reconnect: the key was applied, then pruned (disconnect).
+        let applied = HashSet::new();
+        let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &applied);
+        assert_eq!(pending, vec![("2b042".to_string(), 20)]);
+    }
+
+    #[test]
+    fn pending_handles_multiple_devices() {
+        let mut cfg = Config::default();
+        cfg.set_smartshift_sensitivity("2b042", Some(20));
+        cfg.set_smartshift_sensitivity("4082d", Some(255));
+        let applied: HashSet<String> = ["2b042".to_string()].into_iter().collect();
+        let pending = smartshift_pending(&cfg, &keys(&["2b042", "4082d"]), &applied);
+        assert_eq!(pending, vec![("4082d".to_string(), 255)]);
+    }
+}
