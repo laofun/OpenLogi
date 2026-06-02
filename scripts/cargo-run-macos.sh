@@ -55,4 +55,30 @@ fi
 # stale link. Fall back to a copy if the bundle ever lands on another volume.
 ln -f "$bin" "$MACOS/openlogi-gui" 2>/dev/null || cp -f "$bin" "$MACOS/openlogi-gui"
 
+# Re-sign the bundle with a stable identity so macOS (TCC) keeps the
+# Accessibility / Input Monitoring / Bluetooth grants across rebuilds. The
+# default cargo/linker signature is ad-hoc, which TCC keys on the binary's
+# cdhash — that changes every build, so each rebuild looks like a brand-new app
+# and the grants are dropped. Signing with a fixed certificate makes TCC key on
+# the bundle id + cert (both stable) instead.
+#
+# Identity resolution (first match wins):
+#   1. $OPENLOGI_DEV_SIGN_IDENTITY, if set
+#   2. a self-signed "OpenLogi Dev" code-signing cert in the keychain
+# If neither is found we leave the ad-hoc signature in place (CI / contributors
+# without the cert keep working — they just re-grant permissions after a build).
+# Create the cert once with: scripts/setup-dev-signing.sh
+SIGN_ID="${OPENLOGI_DEV_SIGN_IDENTITY:-}"
+if [ -z "$SIGN_ID" ] && security find-identity -p codesigning 2>/dev/null \
+     | grep -q '"OpenLogi Dev"'; then
+  SIGN_ID="OpenLogi Dev"
+fi
+if [ -n "$SIGN_ID" ]; then
+  # --force replaces the existing (ad-hoc) signature. Sign the binary, not the
+  # whole bundle: the hardlinked Info.plist/Resources don't change between
+  # builds, so signing the Mach-O is enough and avoids re-hashing the icon.
+  codesign --force --sign "$SIGN_ID" "$MACOS/openlogi-gui" 2>/dev/null \
+    || echo "warning: codesign with '$SIGN_ID' failed — permissions may reset" >&2
+fi
+
 exec "$MACOS/openlogi-gui" "$@"

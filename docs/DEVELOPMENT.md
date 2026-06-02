@@ -69,6 +69,47 @@ shader compiler, and link errors about missing `_write` / `_sysconf` /
 `_waitpid` symbols show up because the Nix `apple-sdk-14.4` stub doesn't
 expose `libSystem` the way Apple's real linker wants.
 
+## Keeping macOS permissions across rebuilds
+
+OpenLogi needs Accessibility, Input Monitoring, and (for BLE-direct mice)
+Bluetooth grants. macOS (TCC) ties those grants to the app's **code
+signature**. A bare `cargo build` produces an *ad-hoc* signature, which TCC
+keys on the binary's **cdhash** — and the cdhash changes on every rebuild, so
+each `cargo run -p openlogi-gui` looks like a brand-new app and the grants are
+dropped. That's why permissions reset every time you rebuild.
+
+The fix is to sign the dev bundle with a **stable self-signed certificate**.
+When the bundle carries a real certificate, TCC keys the grant on the
+*designated requirement* — `bundle id + certificate leaf` — instead of the
+cdhash. Both are stable across rebuilds, so you grant permissions once.
+
+Create the certificate once (idempotent — safe to re-run):
+
+```sh
+scripts/setup-dev-signing.sh
+```
+
+This generates a self-signed `"OpenLogi Dev"` code-signing cert (10-year
+validity) and imports it into your login keychain. The dev runner
+(`scripts/cargo-run-macos.sh`, wired as the cargo `runner` in
+`.cargo/config.toml`) then re-signs the bundle with it on every
+`cargo run -p openlogi-gui`. To use a different identity (e.g. a real Apple
+Development cert), set `OPENLOGI_DEV_SIGN_IDENTITY` and it takes precedence.
+
+Notes:
+
+- The cert shows as untrusted (`CSSMERR_TP_NOT_TRUSTED`) in
+  `security find-identity` — that's expected and harmless. `codesign` signs
+  with it regardless, and TCC keys the grant on it. We deliberately don't add
+  it to the trust store (that needs `sudo`).
+- The **first** run after creating the cert still needs a one-time grant — the
+  bundle moves from ad-hoc to the new identity, so TCC sees a new signature
+  once. After that, rebuilds keep the grants.
+- This is dev-only. Production bundles are signed by `xtask` with a real
+  Developer ID (`OPENLOGI_SIGN_IDENTITY`) — see *Packaging the macOS DMG*.
+- Contributors and CI without the cert keep working: the runner leaves the
+  ad-hoc signature in place when no signing identity is found.
+
 ## Project layout
 
 ```
