@@ -14,7 +14,7 @@ pub struct DpiArgs {
 }
 
 pub async fn run(args: DpiArgs) -> Result<()> {
-    let (route, name) = first_online_device().await?;
+    let (route, name, _) = first_online_device().await?;
     println!("device: {name} ({route})");
 
     let before = openlogi_hid::get_dpi(&route)

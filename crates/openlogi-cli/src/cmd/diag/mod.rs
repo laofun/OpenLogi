@@ -34,11 +34,14 @@ impl DiagCmd {
     }
 }
 
-/// Shared device picker: enumerate inventories, return the [`DeviceRoute`] +
-/// display name of the first online paired device (the same selection rule the
-/// GUI uses for its initial target). Builds a Bolt route when the device is
-/// behind a receiver, a direct route otherwise (USB cable / Bluetooth).
-pub(crate) async fn first_online_device() -> Result<(DeviceRoute, String)> {
+/// Shared device picker: enumerate inventories, return the [`DeviceRoute`],
+/// display name, and `config_key` of the first online paired device (the same
+/// selection rule the GUI uses for its initial target). Builds a Bolt route
+/// when the device is behind a receiver, a direct route otherwise (USB cable /
+/// Bluetooth). The `config_key` is empty for a device that does not expose
+/// HID++ feature 0x0003 (DeviceInformation) — `--save` callers should treat an
+/// empty key as "cannot persist".
+pub(crate) async fn first_online_device() -> Result<(DeviceRoute, String, String)> {
     use anyhow::anyhow;
     let inventories = openlogi_hid::enumerate().await?;
     inventories
@@ -55,10 +58,15 @@ pub(crate) async fn first_online_device() -> Result<(DeviceRoute, String)> {
                     product_id: inv.receiver.product_id,
                 },
             };
+            let config_key = paired
+                .model_info
+                .as_ref()
+                .map(openlogi_core::device::DeviceModelInfo::config_key)
+                .unwrap_or_default();
             let name = paired
                 .codename
                 .unwrap_or_else(|| format!("Slot {}", paired.slot));
-            Some((route, name))
+            Some((route, name, config_key))
         })
         .ok_or_else(|| anyhow!("no online HID++ device found — is a Logi mouse paired?"))
 }
