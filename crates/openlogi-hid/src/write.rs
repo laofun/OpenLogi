@@ -129,6 +129,16 @@ fn wheel_mode_to_smartshift(wheel: WheelMode) -> SmartShiftMode {
     }
 }
 
+/// Map OpenLogi's [`SmartShiftMode`] onto the fork's `0x2110` [`WheelMode`] —
+/// the inverse of [`wheel_mode_to_smartshift`], used when writing the legacy
+/// ratchet-control mode.
+fn smartshift_to_wheel(mode: SmartShiftMode) -> WheelMode {
+    match mode {
+        SmartShiftMode::Free => WheelMode::Freespin,
+        SmartShiftMode::Ratchet => WheelMode::Ratchet,
+    }
+}
+
 /// Whichever SmartShift feature a device exposes, normalised onto
 /// [`SmartShiftMode`]. Devices ship one or the other: MX Master 3 / 3S use the
 /// `0x2111` Enhanced variant, the MX Master 2S uses the original `0x2110`.
@@ -183,16 +193,10 @@ impl SmartShift {
                 .set_status(mode, sensitivity)
                 .await
                 .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
-            Self::Legacy(feature) => {
-                let wheel = match mode {
-                    SmartShiftMode::Free => WheelMode::Freespin,
-                    SmartShiftMode::Ratchet => WheelMode::Ratchet,
-                };
-                feature
-                    .set_ratchet_control_mode(Some(wheel), None, None)
-                    .await
-                    .map_err(|e| WriteError::Hidpp(format!("{e:?}")))
-            }
+            Self::Legacy(feature) => feature
+                .set_ratchet_control_mode(Some(smartshift_to_wheel(mode)), None, None)
+                .await
+                .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
         }
     }
 
@@ -207,16 +211,10 @@ impl SmartShift {
                 .set_status(mode, value)
                 .await
                 .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
-            Self::Legacy(feature) => {
-                let wheel = match mode {
-                    SmartShiftMode::Free => WheelMode::Freespin,
-                    SmartShiftMode::Ratchet => WheelMode::Ratchet,
-                };
-                feature
-                    .set_ratchet_control_mode(Some(wheel), Some(value), None)
-                    .await
-                    .map_err(|e| WriteError::Hidpp(format!("{e:?}")))
-            }
+            Self::Legacy(feature) => feature
+                .set_ratchet_control_mode(Some(smartshift_to_wheel(mode)), Some(value), None)
+                .await
+                .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
         }
     }
 }
@@ -434,6 +432,14 @@ mod tests {
             wheel_mode_to_smartshift(WheelMode::Ratchet),
             SmartShiftMode::Ratchet
         );
+    }
+
+    #[test]
+    fn smartshift_to_wheel_round_trips() {
+        // smartshift_to_wheel is the inverse of wheel_mode_to_smartshift.
+        for mode in [SmartShiftMode::Free, SmartShiftMode::Ratchet] {
+            assert_eq!(wheel_mode_to_smartshift(smartshift_to_wheel(mode)), mode);
+        }
     }
 
     #[test]
