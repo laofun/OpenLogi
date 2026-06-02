@@ -10,12 +10,18 @@ use anyhow::Result;
 use clap::Subcommand;
 use openlogi_hid::DeviceRoute;
 
+pub mod battery;
+pub mod controls;
 pub mod dpi;
 pub mod features;
 pub mod smartshift;
 
 #[derive(Debug, Subcommand)]
 pub enum DiagCmd {
+    /// Probe which HID++ battery feature IDs the active device exposes.
+    Battery(battery::BatteryArgs),
+    /// Dump reprogrammable controls with OpenLogi button labels.
+    Controls(controls::ControlsArgs),
     /// Dump every HID++ feature the active device reports.
     Features(features::FeaturesArgs),
     /// Read DPI → write a small delta → read back → restore → report.
@@ -27,6 +33,8 @@ pub enum DiagCmd {
 impl DiagCmd {
     pub async fn run(self) -> Result<()> {
         match self {
+            Self::Battery(args) => battery::run(args).await,
+            Self::Controls(args) => controls::run(args).await,
             Self::Features(args) => features::run(args).await,
             Self::Dpi(args) => dpi::run(args).await,
             Self::Smartshift(args) => smartshift::run(args).await,

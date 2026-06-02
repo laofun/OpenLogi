@@ -9,12 +9,20 @@
 
 use std::sync::Arc;
 
+use hidpp::feature::device_information::{DeviceInformation, DeviceInformationFeature};
 use hidpp::feature::smartshift::{SmartShiftFeature, WheelMode};
+use hidpp::feature::unified_battery::{
+    BatteryLevel as HidppBatteryLevel, BatteryStatus as HidppBatteryStatus, UnifiedBatteryFeature,
+};
 use hidpp::{channel::HidppChannel, device::Device, feature::CreatableFeature};
+use openlogi_core::device::{BatteryInfo, BatteryLevel, BatteryStatus, DeviceTransports};
 use thiserror::Error;
 use tracing::debug;
 
 use crate::adjustable_dpi::AdjustableDpiFeatureV0;
+use crate::reprog_controls::{
+    CtrlIdInfo, FEATURE_ID as REPROG_CONTROLS_FEATURE_ID, ReprogControlsV4,
+};
 use crate::route::{DeviceRoute, open_route_channel};
 use crate::smartshift::{SmartShiftFeatureV0, SmartShiftMode, SmartShiftStatus};
 
@@ -40,47 +48,82 @@ pub struct FeatureEntry {
     pub version: u8,
 }
 
+#[derive(Debug)]
+pub struct BatteryFeatureSummary {
+    pub battery_status_present: bool,
+    pub battery_voltage_present: bool,
+    pub unified_battery_present: bool,
+    pub unified_battery: Result<Option<BatteryInfo>, WriteError>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlEntry {
+    pub index: u8,
+    pub info: CtrlIdInfo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DpiReference {
+    pub min: u16,
+    pub max: u16,
+    pub step: u16,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceIdentitySummary {
+    pub config_key: Option<String>,
+    pub model_ids: Option<[u16; 3]>,
+    pub extended_model_id: Option<u8>,
+    pub transports: Option<DeviceTransports>,
+    pub dpi_reference: Option<DpiReference>,
+}
+
 /// Enumerate every HID++ feature the device on `route` reports — used by
 /// `openlogi diag features` to confirm which DPI / SmartShift / etc.
 /// feature IDs a given peripheral actually exposes (e.g. some mice use
 /// `0x2202 ExtendedAdjustableDpi` instead of `0x2201 AdjustableDpi`).
 pub async fn dump_features(route: &DeviceRoute) -> Result<Vec<FeatureEntry>, WriteError> {
-    use hidpp::feature::feature_set::FeatureSetFeature;
     let index = route.device_index();
     with_route(route, move |channel| async move {
         let mut device = Device::new(Arc::clone(&channel), index)
             .await
             .map_err(|_| WriteError::DeviceUnreachable { index })?;
-        // The root feature exposes the FeatureSet (0x0001) at a fixed
-        // address; we look it up directly rather than going through
-        // `enumerate_features` so the iteration is observable.
-        let feature_set_info = device
-            .root()
-            .get_feature(FeatureSetFeature::ID)
-            .await
-            .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?
-            .ok_or(WriteError::FeatureUnsupported {
-                feature_hex: FeatureSetFeature::ID,
-            })?;
-        let feature_set = device.add_feature::<FeatureSetFeature>(feature_set_info.index);
-        let count = feature_set
-            .count()
-            .await
-            .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
-        let mut entries = Vec::with_capacity(usize::from(count));
-        for i in 0..=count {
-            let info = feature_set
-                .get_feature(i)
-                .await
-                .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
-            entries.push(FeatureEntry {
-                id: info.id,
-                version: info.version,
-            });
-        }
-        Ok(entries)
+        dump_features_on_device(&mut device).await
     })
     .await
+}
+
+async fn dump_features_on_device(device: &mut Device) -> Result<Vec<FeatureEntry>, WriteError> {
+    use hidpp::feature::feature_set::FeatureSetFeature;
+    // The root feature exposes the FeatureSet (0x0001) at a fixed address; we
+    // look it up directly rather than going through `enumerate_features` so the
+    // iteration is observable.
+    let feature_set_info = device
+        .root()
+        .get_feature(FeatureSetFeature::ID)
+        .await
+        .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?
+        .ok_or(WriteError::FeatureUnsupported {
+            feature_hex: FeatureSetFeature::ID,
+        })?;
+    let feature_set = device.add_feature::<FeatureSetFeature>(feature_set_info.index);
+    let count = feature_set
+        .count()
+        .await
+        .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+    let mut entries = Vec::with_capacity(usize::from(count));
+    for i in 0..=count {
+        let info = feature_set
+            .get_feature(i)
+            .await
+            .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+        entries.push(FeatureEntry {
+            id: info.id,
+            version: info.version,
+        });
+    }
+    Ok(entries)
 }
 
 /// Look up `F` on a device by HID++ feature ID, register it with
@@ -104,6 +147,175 @@ async fn open_feature<F: CreatableFeature + 'static>(
         .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?
         .ok_or(WriteError::FeatureUnsupported { feature_hex: F::ID })?;
     Ok(device.add_feature::<F>(info.index))
+}
+
+async fn feature_present(device: &Device, feature_id: u16) -> Result<bool, WriteError> {
+    device
+        .root()
+        .get_feature(feature_id)
+        .await
+        .map(|hit| hit.is_some())
+        .map_err(|e| WriteError::Hidpp(format!("{e:?}")))
+}
+
+fn map_battery_level(level: HidppBatteryLevel) -> BatteryLevel {
+    match level {
+        HidppBatteryLevel::Critical => BatteryLevel::Critical,
+        HidppBatteryLevel::Low => BatteryLevel::Low,
+        HidppBatteryLevel::Good => BatteryLevel::Good,
+        HidppBatteryLevel::Full => BatteryLevel::Full,
+        _ => BatteryLevel::Unknown,
+    }
+}
+
+fn map_battery_status(status: HidppBatteryStatus) -> BatteryStatus {
+    match status {
+        HidppBatteryStatus::Discharging => BatteryStatus::Discharging,
+        HidppBatteryStatus::Charging => BatteryStatus::Charging,
+        HidppBatteryStatus::ChargingSlow => BatteryStatus::ChargingSlow,
+        HidppBatteryStatus::Full => BatteryStatus::Full,
+        HidppBatteryStatus::Error => BatteryStatus::Error,
+        _ => BatteryStatus::Unknown,
+    }
+}
+
+fn is_mx_master_2s_identity(model_ids: Option<[u16; 3]>, config_key: Option<&str>) -> bool {
+    config_key == Some("0b019")
+        || model_ids.is_some_and(|ids| ids.into_iter().any(|id| id == 0xb019))
+}
+
+fn mx_master_2s_dpi_reference() -> DpiReference {
+    DpiReference {
+        min: 200,
+        max: 4000,
+        step: 50,
+        source: "MX Master 2S reference (not protocol-verified)",
+    }
+}
+
+fn transports_from_info(info: &DeviceInformation) -> DeviceTransports {
+    DeviceTransports {
+        usb: info.transport.usb,
+        equad: info.transport.e_quad,
+        btle: info.transport.btle,
+        bluetooth: info.transport.bluetooth,
+    }
+}
+
+async fn read_identity_summary(device: &mut Device) -> Result<DeviceIdentitySummary, WriteError> {
+    let feature = match open_feature::<DeviceInformationFeature>(device).await {
+        Ok(feature) => feature,
+        Err(WriteError::FeatureUnsupported { .. }) => {
+            return Ok(DeviceIdentitySummary {
+                config_key: None,
+                model_ids: None,
+                extended_model_id: None,
+                transports: None,
+                dpi_reference: None,
+            });
+        }
+        Err(err) => return Err(err),
+    };
+    let info = feature
+        .get_device_info()
+        .await
+        .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+    let model_ids = info.model_id;
+    let config_key = format!("{:x}{:04x}", info.extended_model_id, model_ids[0]);
+    let config_key = (config_key != "00000").then_some(config_key);
+    let dpi_reference = is_mx_master_2s_identity(Some(model_ids), config_key.as_deref())
+        .then_some(mx_master_2s_dpi_reference());
+    Ok(DeviceIdentitySummary {
+        config_key,
+        model_ids: Some(model_ids),
+        extended_model_id: Some(info.extended_model_id),
+        transports: Some(transports_from_info(&info)),
+        dpi_reference,
+    })
+}
+
+pub async fn battery_feature_summary(
+    route: &DeviceRoute,
+) -> Result<BatteryFeatureSummary, WriteError> {
+    let index = route.device_index();
+    with_route(route, move |channel| async move {
+        let mut device = Device::new(Arc::clone(&channel), index)
+            .await
+            .map_err(|_| WriteError::DeviceUnreachable { index })?;
+        let battery_status_present = feature_present(&device, 0x1000).await?;
+        let battery_voltage_present = feature_present(&device, 0x1001).await?;
+        let unified_battery_present = feature_present(&device, UnifiedBatteryFeature::ID).await?;
+        let unified_battery = if unified_battery_present {
+            match open_feature::<UnifiedBatteryFeature>(&mut device).await {
+                Ok(feature) => feature
+                    .get_battery_info()
+                    .await
+                    .map(|info| {
+                        Some(BatteryInfo {
+                            percentage: info.charging_percentage,
+                            level: map_battery_level(info.level),
+                            status: map_battery_status(info.status),
+                        })
+                    })
+                    .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
+                Err(err) => Err(err),
+            }
+        } else {
+            Ok(None)
+        };
+        Ok(BatteryFeatureSummary {
+            battery_status_present,
+            battery_voltage_present,
+            unified_battery_present,
+            unified_battery,
+        })
+    })
+    .await
+}
+
+pub async fn dump_reprog_controls(route: &DeviceRoute) -> Result<Vec<ControlEntry>, WriteError> {
+    let index = route.device_index();
+    with_route(route, move |channel| async move {
+        let device = Device::new(Arc::clone(&channel), index)
+            .await
+            .map_err(|_| WriteError::DeviceUnreachable { index })?;
+        let info = device
+            .root()
+            .get_feature(REPROG_CONTROLS_FEATURE_ID)
+            .await
+            .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?
+            .ok_or(WriteError::FeatureUnsupported {
+                feature_hex: REPROG_CONTROLS_FEATURE_ID,
+            })?;
+        let feature = ReprogControlsV4::new(Arc::clone(&channel), index, info.index);
+        let count = feature
+            .get_count()
+            .await
+            .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+        let mut controls = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let info = feature
+                .get_ctrl_id_info(index)
+                .await
+                .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+            controls.push(ControlEntry { index, info });
+        }
+        Ok(controls)
+    })
+    .await
+}
+
+pub async fn device_identity_summary(
+    route: &DeviceRoute,
+) -> Result<DeviceIdentitySummary, WriteError> {
+    let index = route.device_index();
+    with_route(route, move |channel| async move {
+        let mut device = Device::new(Arc::clone(&channel), index)
+            .await
+            .map_err(|_| WriteError::DeviceUnreachable { index })?;
+        read_identity_summary(&mut device).await
+    })
+    .await
 }
 
 /// Whether a failure to open the `0x2111` Enhanced SmartShift feature should

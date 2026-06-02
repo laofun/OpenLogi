@@ -17,6 +17,24 @@ own assets and hardware behavior.
 - Observed direct route in OpenLogi: `046d:b019`.
 - OpenLogi config key currently used by existing config/assets: `0b019`.
 
+### Observed live identity
+
+```text
+model_ids=[b019,4069,0000]
+ext=00
+transports=equad+btle
+config_key=0b019
+```
+
+`model_ids[]` can contain transport-specific alternate product IDs.
+`config_key()` uses only `model_ids[0]`, so this device remains keyed by `0b019`
+regardless of additional model IDs present in the array.
+
+The `4069` ID was not found in the OpenLogi repo or the current external asset registry.
+It is treated as an alternate transport / internal PID (likely the BTLE variant),
+not a new primary config key. Asset lookup in the GUI considers all nonzero model IDs,
+so if the asset registry is later indexed under `4069` it will still match.
+
 ### DeviceInformation `0x0003` caveat
 
 On the observed MX Master 2S direct route, HID++ DeviceInformation may produce a
@@ -31,6 +49,17 @@ DeviceModelInfo::config_key() = "00000"
 `00000` should not be used as a persisted per-device config key for this device.
 For the direct `046d:b019` route, fall back to `0b019` so CLI writes, GUI
 bindings, assets, and auto-apply all refer to the same device section.
+
+## Battery
+
+OpenLogi's live `openlogi list` output shows `battery=—` for MX Master 2S despite the
+external descriptor marking battery support. The inventory layer currently reads only
+HID++ `0x1004 UnifiedBattery`; if the device exposes `0x1000 BatteryStatus` or
+`0x1001 BatteryVoltage` instead, no battery value is produced.
+
+Run `openlogi diag battery` on hardware to determine which battery feature IDs the device
+actually exposes. Decoder support for `0x1000` / `0x1001` is deferred until the feature
+presence and payload shape are confirmed on-device.
 
 ## Feature matrix
 

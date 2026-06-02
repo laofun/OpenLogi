@@ -5,6 +5,17 @@ use clap::Args;
 
 use crate::cmd::diag::first_online_device;
 
+async fn print_dpi_reference(route: &openlogi_hid::DeviceRoute) {
+    if let Ok(summary) = openlogi_hid::device_identity_summary(route).await {
+        if let Some(r) = summary.dpi_reference {
+            println!(
+                "  reference range: {}..={} step {} ({})",
+                r.min, r.max, r.step, r.source
+            );
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct DpiArgs {
     /// DPI to set during the test. Default = current + 200, clamped to the
@@ -21,6 +32,7 @@ pub async fn run(args: DpiArgs) -> Result<()> {
         .await
         .context("read current DPI")?;
     println!("  current DPI: {before}");
+    print_dpi_reference(&route).await;
 
     let target = args.target.unwrap_or_else(|| {
         if before < 3200 {
