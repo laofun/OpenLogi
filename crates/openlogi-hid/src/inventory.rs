@@ -6,16 +6,18 @@ use hidpp::{
     channel::HidppChannel,
     device::Device,
     feature::{
-        device_information::v0::DeviceInformationFeatureV0,
-        unified_battery::v0::{
+        device_information::DeviceInformationFeature,
+        unified_battery::{
             BatteryLevel as HidppBatteryLevel, BatteryStatus as HidppBatteryStatus,
-            UnifiedBatteryFeatureV0,
+            UnifiedBatteryFeature,
         },
     },
-    nibble::U4,
     receiver::{
         self, Receiver,
-        bolt::{BoltDeviceConnection, BoltDeviceKind, BoltEvent, BoltReceiver},
+        bolt::{
+            DeviceConnection as BoltDeviceConnection, DeviceKind as BoltDeviceKind,
+            Event as BoltEvent, Receiver as BoltReceiver,
+        },
     },
 };
 use openlogi_core::device::{
@@ -38,6 +40,18 @@ const ARRIVAL_DRAIN: Duration = Duration::from_millis(1500);
 /// Maximum number of pairing slots a Bolt receiver supports. We iterate this
 /// range to surface paired-but-offline devices that won't fire arrival events.
 const MAX_BOLT_SLOTS: u8 = 6;
+
+/// Upper bound on probing one HID node. `hidpp`'s request/response has no
+/// timeout of its own, so without this a single unresponsive (e.g. asleep)
+/// device wedges the whole enumeration — and the GUI runs `enumerate` on a
+/// polling watcher, so a permanent hang would stall every later refresh.
+///
+/// Kept short so a snapshot settles quickly: a timed-out node is skipped and
+/// re-probed on the next watcher tick (~2 s), and the first probe usually wakes
+/// the device so the retry succeeds fast. Comfortably above a healthy device's
+/// probe time (the Bolt arrival drain alone is 1.5 s), so awake devices never
+/// trip it.
+const PROBE_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub enum InventoryError {
@@ -66,10 +80,13 @@ pub async fn enumerate() -> Result<Vec<DeviceInventory>, InventoryError> {
 
     let mut inventories = Vec::new();
     for dev in candidates {
-        match probe_one(dev).await {
-            Ok(Some(inv)) => inventories.push(inv),
-            Ok(None) => {}
-            Err(e) => warn!(error = ?e, "skipping device that failed to probe"),
+        match timeout(PROBE_BUDGET, probe_one(dev)).await {
+            Ok(Ok(Some(inv))) => inventories.push(inv),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => warn!(error = ?e, "skipping device that failed to probe"),
+            Err(_) => {
+                warn!(budget = ?PROBE_BUDGET, "device probe timed out — skipping (asleep/unresponsive)");
+            }
         }
     }
 
@@ -100,7 +117,7 @@ async fn probe_one(dev: async_hid::Device) -> Result<Option<DeviceInventory>, In
 
     let mut paired = Vec::new();
     for slot in 1u8..=MAX_BOLT_SLOTS {
-        let pairing = match bolt.get_device_pairing_information(U4::from_lo(slot)).await {
+        let pairing = match bolt.get_device_pairing_information(slot).await {
             Ok(p) => p,
             Err(e) => {
                 debug!(slot, error = ?e, "slot empty or unreadable");
@@ -283,7 +300,7 @@ async fn probe_features(
         return (None, None);
     }
 
-    let battery = match device.get_feature::<UnifiedBatteryFeatureV0>() {
+    let battery = match device.get_feature::<UnifiedBatteryFeature>() {
         Some(feature) => feature
             .get_battery_info()
             .await
@@ -296,7 +313,7 @@ async fn probe_features(
         None => None,
     };
 
-    let model_info = match device.get_feature::<DeviceInformationFeatureV0>() {
+    let model_info = match device.get_feature::<DeviceInformationFeature>() {
         Some(feature) => match feature.get_device_info().await {
             Ok(info) => {
                 let serial_number = if info.capabilities.serial_number {

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4](https://github.com/AprilNEA/OpenLogi/compare/openlogi-hidpp-v0.3.3...openlogi-hidpp-v0.3.4) - 2026-06-01
+
+### Added
+
+- *(openlogi-hidpp)* vendor the hidpp 0.3 fork from lus/logy
+
+### Fixed
+
+- address /code-review findings (write timeouts, scanning fallback, asset sync, CoreBluetooth safety)
+
+### Other
+
+- *(hidpp)* up-convert short→long inside the channel for long-only BLE
+
+## [0.3.3](https://github.com/AprilNEA/OpenLogi/compare/openlogi-assets-v0.3.2...openlogi-assets-v0.3.3) - 2026-06-01
+
+### Fixed
+
+- *(assets)* match devices by displayName when no PID lookup hits
+
 ## [0.3.2](https://github.com/AprilNEA/OpenLogi/compare/v0.3.1...v0.3.2) - 2026-06-01
 
 ### Other

@@ -153,13 +153,10 @@ impl AppView {
 }
 
 fn open_accessibility_settings() {
-    openlogi_hook::Hook::prompt_accessibility();
-    if let Err(e) = std::process::Command::new("open")
-        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-        .spawn()
-    {
-        warn!(error = %e, "could not open System Settings");
-    }
+    use crate::platform::permissions::{self, Permission};
+    // Single source of the prompt + System Settings deep link, shared with the
+    // Settings window's Permissions row.
+    permissions::open_pane(Permission::Accessibility);
 }
 
 impl Render for AppView {
@@ -176,10 +173,11 @@ impl Render for AppView {
         let has_device = cx
             .try_global::<AppState>()
             .is_some_and(|s| !s.device_list.is_empty());
+        let scanning = cx.try_global::<AppState>().is_some_and(|s| s.scanning);
         let body = if has_device {
             body(&self.mouse_model, &self.dpi_panel).into_any_element()
         } else {
-            device_empty_state(pal)
+            device_empty_state(pal, scanning)
         };
 
         v_flex()
@@ -229,7 +227,7 @@ fn body(mouse_model: &Entity<MouseModelView>, dpi_panel: &Entity<DpiPanel>) -> i
 /// Body shown when no device is connected. The inventory watcher keeps polling
 /// (every 2 s) and `AppView`'s `AppState` observer swaps the device UI back in
 /// the moment one appears, so this is purely a wait-and-pair placeholder.
-fn device_empty_state(pal: Palette) -> AnyElement {
+fn device_empty_state(pal: Palette, scanning: bool) -> AnyElement {
     v_flex()
         .flex_1()
         .w_full()
@@ -247,7 +245,11 @@ fn device_empty_state(pal: Palette) -> AnyElement {
             div()
                 .text_xl()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(tr!("No device connected")),
+                .child(if scanning {
+                    tr!("Scanning for devices…")
+                } else {
+                    tr!("No device connected")
+                }),
         )
         .child(
             div()
