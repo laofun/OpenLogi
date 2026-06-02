@@ -246,15 +246,28 @@ fn main() -> Result<()> {
                             let inv = new_inv.clone();
                             std::thread::spawn(move || sync_assets_if_needed(&inv));
                         }
-                        cx.update(|cx| {
+                        let writes = cx.update(|cx| {
                             let cache = asset::AssetResolver::new();
-                            cx.update_global::<AppState, _>(|state, _| {
+                            let writes = cx.update_global::<AppState, _>(|state, _| {
                                 state.refresh_inventories(&new_inv, &cache);
                                 state.scanning = false;
+                                state.pending_smartshift_writes()
                             });
                             #[cfg(target_os = "macos")]
                             platform::tray::set_device_status(&tray_status(cx));
+                            writes
                         });
+                        // Off the GPUI thread: re-apply each connected device's
+                        // persisted SmartShift sensitivity (fresh channel,
+                        // capture = None). Once per connection — see
+                        // AppState::pending_smartshift_writes.
+                        for (route, value) in writes {
+                            hardware::apply_smartshift_sensitivity_in_background(
+                                None,
+                                Some(route),
+                                value,
+                            );
+                        }
                     }
                     Some(bundle) = app_rx.recv() => {
                         cx.update(|cx| {
