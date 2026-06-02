@@ -118,8 +118,9 @@ fn is_missing_enhanced(err: &WriteError) -> bool {
 }
 
 /// Map the fork's `0x2110` [`WheelMode`] onto OpenLogi's [`SmartShiftMode`].
-/// A reserved/future variant maps to [`SmartShiftMode::Ratchet`], the "safe"
-/// clicky default OpenLogi uses elsewhere.
+/// A future `#[non_exhaustive]` variant maps to [`SmartShiftMode::Ratchet`],
+/// the "safe" clicky default OpenLogi uses elsewhere. (Reserved wire bytes
+/// never reach here — the fork's `get_ratchet_control_mode` rejects them.)
 fn wheel_mode_to_smartshift(wheel: WheelMode) -> SmartShiftMode {
     if matches!(wheel, WheelMode::Freespin) {
         SmartShiftMode::Free
