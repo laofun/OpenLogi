@@ -232,9 +232,13 @@ impl AppState {
     ///   value or the dispatch later succeeds), so a sleeping/failing device is
     ///   not hammered every poll tick. Pruning the set to the connected keys
     ///   means a disconnect→reconnect re-applies.
-    /// - **No clobber.** Applied values are synced back into the in-memory
-    ///   `self.config` so the GUI's next full-file `save_atomic()` preserves
-    ///   them instead of overwriting the file without them.
+    /// - **Clobber mitigation.** Once observed here, an applied value is synced
+    ///   back into the in-memory `self.config` so the GUI's next full-file
+    ///   `save_atomic()` preserves it instead of overwriting the file without
+    ///   it. This closes the window for any save *after* the refresh that
+    ///   observed the value; a GUI save in the narrow gap between the CLI's
+    ///   `--save` and the next inventory refresh can still drop it (bounded by
+    ///   the ~2 s poll interval).
     /// - **Steady-state cheap.** When every connected key is already evaluated,
     ///   returns early without touching the disk.
     ///
