@@ -1,12 +1,12 @@
 # OpenLogi Architecture
 
-OpenLogi is built from six application crates in a Cargo workspace — a native,
-local-first alternative to Logitech Options+ that controls Logitech mice over
-HID++. (A seventh member, `xtask`, is a `publish = false` build helper that
-generates the updater manifest; it is not part of the application.) This
-document traces the crate layering and the HID++ flow end to end. For the quick
-orientation an AI agent needs before touching code, start with
-[`../CLAUDE.md`](../CLAUDE.md); for the developer workflow see
+OpenLogi is built from seven application crates in a Cargo workspace — a
+native, local-first alternative to Logitech Options+ that controls Logitech
+mice over HID++. (An eighth member, `xtask`, is a `publish = false` build helper
+that handles macOS packaging and generates the updater manifest; it is not part
+of the application.) This document traces the crate layering and the HID++ flow
+end to end. For the quick orientation an AI agent needs before touching code,
+start with [`../CLAUDE.md`](../CLAUDE.md); for the developer workflow see
 [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 ## 1. Overview
@@ -14,10 +14,11 @@ orientation an AI agent needs before touching code, start with
 ```
   openlogi-cli   -> openlogi-core, openlogi-hid, openlogi-assets
   openlogi-gui   -> openlogi-core, openlogi-hid, openlogi-hook, openlogi-assets
-  openlogi-hid   -> openlogi-core
+  openlogi-hid   -> openlogi-core, openlogi-hidpp
   openlogi-hook  -> openlogi-core
   openlogi-core     (foundation: no internal deps)
   openlogi-assets   (foundation: no internal deps)
+  openlogi-hidpp    (foundation: vendored hidpp fork, no internal deps)
 ```
 
 Read `->` as "depends on".
@@ -27,18 +28,27 @@ button/action catalog. It is deliberately I/O-free (except reading and writing
 its own config file) and never depends on `hidpp`, `async-hid`, or any platform
 API. To keep that boundary, core **mirrors** the few HID++ types it needs (for
 example `DeviceKind`, which mirrors `hidpp::receiver::bolt::BoltDeviceKind`, and
-`BatteryStatus`, which mirrors `hidpp 0.2`'s `BatteryStatus`) rather than
+`BatteryStatus`, which mirrors the `hidpp` crate's `BatteryStatus`) rather than
 importing them from `hidpp` — so the protocol and platform crates never leak
 their types upward into core.
 
-`openlogi-hid` and `openlogi-hook` each depend on core and add one capability:
-the HID++ protocol and the macOS input hook, respectively. `openlogi-assets` is
-a second foundation crate — it has no internal dependencies (not even on core)
-and provides the device-render registry schema plus HTTP fetch helpers for the
-`assets.openlogi.org` host. `openlogi-cli` and `openlogi-gui` sit at the top and
-compose the lower crates into the `openlogi` and `openlogi-gui` binaries: the
-CLI builds on core, hid, and assets; the GUI builds on core, hid, hook, and
-assets.
+`openlogi-hidpp` is a third foundation crate (no internal deps): OpenLogi's
+**vendored fork of the `hidpp` crate** (from `lus/logy`, upstream v0.3.0),
+carrying OpenLogi-specific changes such as BLE long-report handling. Its library
+target stays named `hidpp`, so `openlogi-hid` consumes it as `hidpp` and the
+fork is invisible to dependents. It deliberately opts out of the workspace lint
+profile (it is third-party code) and declares its own MSRV of `1.87` (higher
+than the workspace's `1.85`), which in practice raises the whole build's MSRV to
+`1.87` through `openlogi-hid`.
+
+`openlogi-hid` and `openlogi-hook` each add one capability on top of core: the
+HID++ protocol (built on `openlogi-hidpp`) and the macOS input hook,
+respectively. `openlogi-assets` is another foundation crate — it has no internal
+dependencies (not even on core) and provides the device-render registry schema
+plus HTTP fetch helpers for the `assets.openlogi.org` host. `openlogi-cli` and
+`openlogi-gui` sit at the top and compose the lower crates into the `openlogi`
+and `openlogi-gui` binaries: the CLI builds on core, hid, and assets; the GUI
+builds on core, hid, hook, and assets.
 
 ## 2. openlogi-core
 
@@ -103,10 +113,10 @@ it pre-filters candidates on vendor/product id before paying the ~100 ms
 channel-open cost — otherwise, on a host that also has a Bolt receiver, every
 direct write would needlessly open the receiver's channel first.
 
-### 3.3 Feature wrappers — and the `hidpp 0.2` registry workaround
+### 3.3 Feature wrappers — and the `hidpp` registry workaround
 
-`hidpp 0.2` ships no typed wrappers for the features OpenLogi drives, so each is
-re-implemented here:
+`openlogi-hid` re-implements its own typed wrapper for each feature it drives,
+in this crate rather than relying on the vendored `hidpp` fork's wrappers:
 
 | Feature | ID | File | Purpose |
 |---|---|---|---|
@@ -115,9 +125,9 @@ re-implemented here:
 | ReprogControlsV4 | `0x1b04` | `reprog_controls.rs` | divert + decode buttons |
 | Thumbwheel | `0x2150` | `thumbwheel.rs` | divert the MX thumb wheel |
 
-**The feature-resolution workaround (critical).** `hidpp 0.2`'s central feature
-registry reports `versions: &[]` for the features OpenLogi cares about, so a
-`get_feature::<F>()` keyed by the wrapper's `TypeId` returns `None`.
+**The feature-resolution workaround (critical).** The `hidpp` central feature
+registry reports `versions: &[]` for many of the features OpenLogi cares about,
+so a `get_feature::<F>()` keyed by the wrapper's `TypeId` returns `None`.
 `open_feature` (in `write.rs`) works around this:
 it asks the device's *root* feature for the index of a feature ID
 (`device.root().get_feature(F::ID)`, which returns the assigned index
@@ -239,15 +249,17 @@ User-facing strings go through the `tr!` i18n macro.
 
 Three walkthroughs that cross crate boundaries.
 
-**Startup & inventory.** On launch the GUI gathers the HID++ inventory
-**synchronously on the main thread** (GPUI owns the main thread, so the
-blocking `enumerate_blocking` wrapper cannot move onto a tokio runtime). That
-wrapper calls `openlogi-hid::enumerate`, which merges Bolt arrival events, the
-per-slot pairing register, and direct probes. It then builds the device list
-and resolves each
-device's assets (`openlogi-assets`) and current DPI / SmartShift state,
-populating `AppState`. A separate 2-second watcher thread re-enumerates
-afterwards for hot-plug.
+**Startup & inventory.** The GUI **never blocks startup on HID enumeration** —
+a sleeping or unresponsive device must not be able to wedge the main thread
+before the window opens. So launch starts with an empty inventory, opens the
+window immediately, and lets the `inventory` watcher do the discovery: on its
+first tick (and every 2 s after, for hot-plug) it calls
+`openlogi-hid::enumerate` off the main thread — merging Bolt arrival events,
+the per-slot pairing register, and direct probes — and
+`AppState::refresh_inventories` wires up devices, bindings, and the hook live.
+Asset resolution
+(`openlogi-assets`) and current DPI / SmartShift state are filled in the
+background as the first devices appear.
 
 **Side-button press → remap.** The `CGEventTap` in `openlogi-hook` fires its
 callback on the tap thread → `hook_runtime` looks up the binding for that
