@@ -218,27 +218,87 @@ async fn probe_direct(
         return None;
     }
 
-    // Without a Bolt receiver we don't have a wpid, codename, or pairing
-    // info — those live on the receiver registers. Use the HID name as
-    // the display fallback and leave wpid empty.
-    debug!(name = %info.name, "BT-direct / wired device recognised");
+    let known = known_direct_device(info.vendor_id, info.product_id);
+    let model_info = enrich_direct_model_info(model_info, known.as_ref());
+    let codename = known
+        .as_ref()
+        .map_or_else(|| info.name.clone(), |known| known.name.to_string());
+    let kind = known
+        .as_ref()
+        .map_or(DeviceKind::Unknown, |known| known.kind);
+
+    // Without a Bolt receiver we don't have a wpid or pairing info — those live
+    // on the receiver registers. Use known direct-device metadata when we have
+    // it; otherwise fall back to the HID interface name and an unknown kind.
+    debug!(name = %codename, "BT-direct / wired device recognised");
     Some(DeviceInventory {
         receiver: ReceiverInfo {
-            name: info.name.clone(),
+            name: codename.clone(),
             vendor_id: info.vendor_id,
             product_id: info.product_id,
             unique_id: None,
         },
         paired: vec![PairedDevice {
             slot: DIRECT_DEVICE_INDEX,
-            codename: Some(info.name.clone()),
+            codename: Some(codename),
             wpid: None,
-            kind: DeviceKind::Unknown,
+            kind,
             online: true,
             battery,
             model_info,
         }],
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KnownDirectDevice {
+    name: &'static str,
+    kind: DeviceKind,
+    model_id: u16,
+}
+
+fn known_direct_device(vendor_id: u16, product_id: u16) -> Option<KnownDirectDevice> {
+    match (vendor_id, product_id) {
+        (0x046d, 0xb019) => Some(KnownDirectDevice {
+            name: "MX Master 2S",
+            kind: DeviceKind::Mouse,
+            model_id: 0xb019,
+        }),
+        _ => None,
+    }
+}
+
+fn enrich_direct_model_info(
+    model_info: Option<DeviceModelInfo>,
+    known: Option<&KnownDirectDevice>,
+) -> Option<DeviceModelInfo> {
+    match (model_info, known) {
+        (Some(model), _) if !is_placeholder_model_info(&model) => Some(model),
+        (_, Some(known)) => Some(known_direct_model_info(known)),
+        (model, None) => model,
+    }
+}
+
+fn known_direct_model_info(known: &KnownDirectDevice) -> DeviceModelInfo {
+    DeviceModelInfo {
+        entity_count: 0,
+        serial_number: None,
+        unit_id: [0; 4],
+        transports: DeviceTransports::default(),
+        model_ids: [known.model_id, 0, 0],
+        extended_model_id: 0,
+    }
+}
+
+fn is_placeholder_model_info(model: &DeviceModelInfo) -> bool {
+    model.extended_model_id == 0
+        && model.model_ids == [0, 0, 0]
+        && model.unit_id == [0; 4]
+        && model.serial_number.is_none()
+        && !model.transports.usb
+        && !model.transports.equad
+        && !model.transports.btle
+        && !model.transports.bluetooth
 }
 
 async fn drain_device_arrival(bolt: &BoltReceiver) -> Vec<BoltDeviceConnection> {
@@ -424,5 +484,66 @@ fn map_battery_status(status: HidppBatteryStatus) -> BatteryStatus {
         HidppBatteryStatus::Full => BatteryStatus::Full,
         HidppBatteryStatus::Error => BatteryStatus::Error,
         _ => BatteryStatus::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn placeholder_model_info() -> DeviceModelInfo {
+        DeviceModelInfo {
+            entity_count: 0,
+            serial_number: None,
+            unit_id: [0; 4],
+            transports: DeviceTransports::default(),
+            model_ids: [0; 3],
+            extended_model_id: 0,
+        }
+    }
+
+    #[test]
+    fn known_direct_device_recognises_mx_master_2s() {
+        let Some(known) = known_direct_device(0x046d, 0xb019) else {
+            panic!("MX Master 2S should be known");
+        };
+        assert_eq!(known.name, "MX Master 2S");
+        assert_eq!(known.kind, DeviceKind::Mouse);
+        assert_eq!(known.model_id, 0xb019);
+    }
+
+    #[test]
+    fn known_direct_model_info_uses_product_id_as_config_key() {
+        let Some(known) = known_direct_device(0x046d, 0xb019) else {
+            panic!("MX Master 2S should be known");
+        };
+        let model = known_direct_model_info(&known);
+        assert_eq!(model.config_key(), "0b019");
+        assert_eq!(model.model_ids, [0xb019, 0, 0]);
+    }
+
+    #[test]
+    fn placeholder_model_info_detects_all_zero_identity() {
+        let model = placeholder_model_info();
+        assert!(is_placeholder_model_info(&model));
+    }
+
+    #[test]
+    fn placeholder_model_info_rejects_nonzero_model_id() {
+        let mut model = placeholder_model_info();
+        model.model_ids[0] = 0xb019;
+        assert!(!is_placeholder_model_info(&model));
+    }
+
+    #[test]
+    fn enrich_direct_model_info_replaces_placeholder_for_known_device() {
+        let Some(known) = known_direct_device(0x046d, 0xb019) else {
+            panic!("MX Master 2S should be known");
+        };
+        let Some(model) = enrich_direct_model_info(Some(placeholder_model_info()), Some(&known))
+        else {
+            panic!("known direct device should synthesize model info");
+        };
+        assert_eq!(model.config_key(), "0b019");
     }
 }

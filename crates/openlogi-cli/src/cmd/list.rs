@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use openlogi_core::device::{BatteryInfo, DeviceInventory, DeviceModelInfo, PairedDevice};
+use openlogi_hid::DIRECT_DEVICE_INDEX;
 
 #[derive(Debug, Args)]
 pub struct ListArgs {}
@@ -62,16 +63,23 @@ fn print_inventory(inv: &DeviceInventory) {
 fn format_device(d: &PairedDevice) -> String {
     let dot = if d.online { "●" } else { "○" };
     let codename = d.codename.as_deref().unwrap_or("Unknown device");
-    let wpid = d
-        .wpid
-        .map_or_else(|| "wpid=?".to_string(), |w| format!("wpid={w:04x}"));
+    let route_hint = d.wpid.map_or_else(
+        || {
+            if d.slot == DIRECT_DEVICE_INDEX {
+                "direct".to_string()
+            } else {
+                "wpid=?".to_string()
+            }
+        },
+        |w| format!("wpid={w:04x}"),
+    );
     let battery = d
         .battery
         .as_ref()
         .map_or_else(|| "battery=—".to_string(), format_battery);
     let kind = format!("{:?}", d.kind).to_lowercase();
     format!(
-        "slot {} {dot} {codename} ({kind}, {wpid}, {battery})",
+        "slot {} {dot} {codename} ({kind}, {route_hint}, {battery})",
         d.slot
     )
 }
@@ -115,8 +123,48 @@ fn format_model(m: &DeviceModelInfo) -> String {
         let _ = write!(unit, "{b:02x}");
     }
     let serial = m.serial_number.as_deref().unwrap_or("—");
+    let config_key = m.config_key();
     format!(
-        "     model_ids=[{ids}] ext={:02x} serial={serial} unit_id={unit} transports={transports}",
+        "     model_ids=[{ids}] ext={:02x} serial={serial} unit_id={unit} transports={transports} config_key={config_key}",
         m.extended_model_id
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openlogi_core::device::{DeviceKind, DeviceTransports};
+
+    #[test]
+    fn format_device_marks_direct_device_without_wpid() {
+        let device = PairedDevice {
+            slot: DIRECT_DEVICE_INDEX,
+            codename: Some("MX Master 2S".to_string()),
+            wpid: None,
+            kind: DeviceKind::Mouse,
+            online: true,
+            battery: None,
+            model_info: None,
+        };
+
+        let formatted = format_device(&device);
+        assert!(formatted.contains("(mouse, direct, battery=—)"));
+        assert!(!formatted.contains("wpid=?"));
+    }
+
+    #[test]
+    fn format_model_includes_config_key() {
+        let model = DeviceModelInfo {
+            entity_count: 0,
+            serial_number: None,
+            unit_id: [0; 4],
+            transports: DeviceTransports::default(),
+            model_ids: [0xb019, 0, 0],
+            extended_model_id: 0,
+        };
+
+        let formatted = format_model(&model);
+        assert!(formatted.contains("model_ids=[b019,0000,0000]"));
+        assert!(formatted.contains("config_key=0b019"));
+    }
 }
