@@ -9,6 +9,8 @@
 
 use std::sync::Arc;
 
+#[allow(unused_imports)]
+use hidpp::feature::smartshift::{SmartShiftFeature, WheelMode};
 use hidpp::{channel::HidppChannel, device::Device, feature::CreatableFeature};
 use thiserror::Error;
 use tracing::debug;
@@ -103,6 +105,18 @@ async fn open_feature<F: CreatableFeature + 'static>(
         .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?
         .ok_or(WriteError::FeatureUnsupported { feature_hex: F::ID })?;
     Ok(device.add_feature::<F>(info.index))
+}
+
+/// Map the fork's `0x2110` [`WheelMode`] onto OpenLogi's [`SmartShiftMode`].
+/// A reserved/future variant maps to [`SmartShiftMode::Ratchet`], the "safe"
+/// clicky default OpenLogi uses elsewhere.
+#[cfg_attr(not(test), allow(dead_code))]
+fn wheel_mode_to_smartshift(wheel: WheelMode) -> SmartShiftMode {
+    if matches!(wheel, WheelMode::Freespin) {
+        SmartShiftMode::Free
+    } else {
+        SmartShiftMode::Ratchet
+    }
 }
 
 /// Read the device's current DPI on sensor 0 — companion to [`set_dpi`].
@@ -273,5 +287,32 @@ where
     match open_route_channel(route).await? {
         Some(channel) => f(channel).await,
         None => Err(WriteError::DeviceNotFound),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::smartshift::SmartShiftMode;
+
+    #[test]
+    fn smartshift_and_wheel_mode_byte_encodings_match() {
+        // The whole design relies on 0x2110 WheelMode and 0x2111
+        // SmartShiftMode sharing one wire encoding (Free/Freespin = 1,
+        // Ratchet = 2). If the fork ever renumbers WheelMode this fails loudly.
+        assert_eq!(SmartShiftMode::Free.as_byte(), WheelMode::Freespin as u8);
+        assert_eq!(SmartShiftMode::Ratchet.as_byte(), WheelMode::Ratchet as u8);
+    }
+
+    #[test]
+    fn wheel_mode_maps_to_smartshift_mode() {
+        assert_eq!(
+            wheel_mode_to_smartshift(WheelMode::Freespin),
+            SmartShiftMode::Free
+        );
+        assert_eq!(
+            wheel_mode_to_smartshift(WheelMode::Ratchet),
+            SmartShiftMode::Ratchet
+        );
     }
 }
