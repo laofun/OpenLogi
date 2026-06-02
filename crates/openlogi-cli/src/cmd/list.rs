@@ -85,9 +85,14 @@ fn format_device(d: &PairedDevice) -> String {
 }
 
 fn format_battery(b: &BatteryInfo) -> String {
-    let level = format!("{:?}", b.level).to_lowercase();
     let status = format!("{:?}", b.status).to_lowercase();
-    format!("battery={}% {level} ({status})", b.percentage)
+    // `0%` is the legacy `0x1000` "percentage unknown" sentinel (e.g. while
+    // charging): show the status only, not a misleading `0% critical`.
+    if b.percentage == 0 {
+        return format!("battery={} ({status})", b.percentage_display());
+    }
+    let level = format!("{:?}", b.level).to_lowercase();
+    format!("battery={} {level} ({status})", b.percentage_display())
 }
 
 fn format_model(m: &DeviceModelInfo) -> String {
@@ -133,7 +138,28 @@ fn format_model(m: &DeviceModelInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openlogi_core::device::{DeviceKind, DeviceTransports};
+    use openlogi_core::device::{BatteryLevel, BatteryStatus, DeviceKind, DeviceTransports};
+
+    #[test]
+    fn format_battery_shows_percentage_and_level() {
+        let b = BatteryInfo {
+            percentage: 90,
+            level: BatteryLevel::Full,
+            status: BatteryStatus::Discharging,
+        };
+        assert_eq!(format_battery(&b), "battery=90% full (discharging)");
+    }
+
+    #[test]
+    fn format_battery_zero_percent_charging_hides_bogus_percent() {
+        // 0% is the "unknown" sentinel; while charging show status only.
+        let b = BatteryInfo {
+            percentage: 0,
+            level: BatteryLevel::Unknown,
+            status: BatteryStatus::Charging,
+        };
+        assert_eq!(format_battery(&b), "battery=?% (charging)");
+    }
 
     #[test]
     fn format_device_marks_direct_device_without_wpid() {

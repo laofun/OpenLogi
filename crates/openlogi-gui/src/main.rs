@@ -412,7 +412,9 @@ fn tray_status(cx: &gpui::App) -> String {
         .map_or_else(
             || rust_i18n::t!("No device connected").into_owned(),
             |record| match &record.battery {
-                Some(battery) => format!("{} · {}%", record.display_name, battery.percentage),
+                Some(battery) => {
+                    format!("{} · {}", record.display_name, battery.percentage_display())
+                }
                 None => record.display_name.clone(),
             },
         )

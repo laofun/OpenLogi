@@ -81,10 +81,34 @@ impl BatteryStatusFeature {
         let raw = self.get_status().await?;
         Ok(BatteryInfo {
             percentage: raw.percentage,
-            level: percentage_to_level(raw.percentage),
+            // `0%` is the "percentage unknown" sentinel (e.g. while charging the
+            // device stops reporting a discharge level), so the coarse level
+            // bucket is meaningless — surface `Unknown` rather than `Critical`.
+            level: if raw.percentage == 0 {
+                BatteryLevel::Unknown
+            } else {
+                percentage_to_level(raw.percentage)
+            },
             status: raw.status,
         })
     }
+}
+
+/// Whether a decoded `0x1000` reading carries usable information.
+///
+/// `0%` is the feature's "percentage unknown" sentinel: the device only
+/// reports a *discharge* percentage, so while it is on the charging cable it
+/// returns `0%` with a charging status byte. Such a reading is still
+/// meaningful (we can show "charging"). Only a `0%` reading whose status is
+/// `Discharging`/`Unknown` carries nothing — that's the genuinely-unknown or
+/// degraded just-woken (all-zero) read, which the caller drops.
+#[must_use]
+pub fn is_informative(info: &BatteryInfo) -> bool {
+    info.percentage != 0
+        || !matches!(
+            info.status,
+            BatteryStatus::Discharging | BatteryStatus::Unknown
+        )
 }
 
 /// Decode the `0x1000` status enum byte (`params[2]`) into the core
@@ -117,8 +141,38 @@ fn percentage_to_level(pct: u8) -> BatteryLevel {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_status, percentage_to_level};
-    use openlogi_core::device::{BatteryLevel, BatteryStatus};
+    use super::{decode_status, is_informative, percentage_to_level};
+    use openlogi_core::device::{BatteryInfo, BatteryLevel, BatteryStatus};
+
+    fn info(percentage: u8, status: BatteryStatus) -> BatteryInfo {
+        BatteryInfo {
+            percentage,
+            level: percentage_to_level(percentage),
+            status,
+        }
+    }
+
+    #[test]
+    fn nonzero_percentage_is_informative() {
+        assert!(is_informative(&info(90, BatteryStatus::Discharging)));
+        assert!(is_informative(&info(5, BatteryStatus::Discharging)));
+    }
+
+    #[test]
+    fn zero_percent_while_charging_is_informative() {
+        // Device on the charging cable: percentage unknown (0) but status
+        // carries the real charging state — keep the reading.
+        assert!(is_informative(&info(0, BatteryStatus::Charging)));
+        assert!(is_informative(&info(0, BatteryStatus::ChargingSlow)));
+        assert!(is_informative(&info(0, BatteryStatus::Full)));
+    }
+
+    #[test]
+    fn zero_percent_discharging_or_unknown_is_not_informative() {
+        // Genuine "unknown" / degraded just-woken all-zero read.
+        assert!(!is_informative(&info(0, BatteryStatus::Discharging)));
+        assert!(!is_informative(&info(0, BatteryStatus::Unknown)));
+    }
 
     #[test]
     fn status_enum_discharging() {

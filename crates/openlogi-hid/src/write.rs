@@ -290,7 +290,9 @@ async fn read_legacy_battery(
     channel: &Arc<HidppChannel>,
     index: u8,
 ) -> Result<Option<BatteryInfo>, WriteError> {
-    use crate::battery_status::{BatteryStatusFeature, FEATURE_ID as BATTERY_STATUS_FEATURE_ID};
+    use crate::battery_status::{
+        BatteryStatusFeature, FEATURE_ID as BATTERY_STATUS_FEATURE_ID, is_informative,
+    };
     let info = device
         .root()
         .get_feature(BATTERY_STATUS_FEATURE_ID)
@@ -304,7 +306,9 @@ async fn read_legacy_battery(
         .get_battery_info()
         .await
         .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
-    Ok((battery.percentage != 0).then_some(battery))
+    // Keep a 0% charging reading (percentage is the unknown sentinel, status is
+    // real); drop only a 0% discharging/unknown read.
+    Ok(is_informative(&battery).then_some(battery))
 }
 
 pub async fn dump_reprog_controls(route: &DeviceRoute) -> Result<Vec<ControlEntry>, WriteError> {

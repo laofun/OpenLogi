@@ -56,6 +56,22 @@ pub struct BatteryInfo {
     pub status: BatteryStatus,
 }
 
+impl BatteryInfo {
+    /// Charge percentage rendered for display: the number followed by `%`, or
+    /// `?%` when the percentage is the `0` "unknown" sentinel. The legacy
+    /// `0x1000 BatteryStatus` feature reports `0` whenever it has no discharge
+    /// reading (most notably while charging), so a bare `0%` would be
+    /// misleading. Pair with [`Self::status`] for the charge state.
+    #[must_use]
+    pub fn percentage_display(&self) -> String {
+        if self.percentage == 0 {
+            "?%".to_string()
+        } else {
+            format!("{}%", self.percentage)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ReceiverInfo {
     pub name: String,

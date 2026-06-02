@@ -191,7 +191,7 @@ fn battery_view(b: &BatteryInfo, pal: Palette) -> AnyElement {
         .text_xs()
         .text_color(pal.text_muted)
         .child(Icon::new(battery_icon(b)).size_3())
-        .child(format!("{}%", b.percentage))
+        .child(b.percentage_display())
         .into_any_element()
 }
 

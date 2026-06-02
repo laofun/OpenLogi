@@ -26,11 +26,15 @@ pub async fn run(_args: BatteryArgs) -> Result<()> {
     );
     if summary.battery_status_present {
         match summary.legacy_battery {
+            Ok(Some(b)) if b.percentage == 0 => {
+                // 0% is the "percentage unknown" sentinel (e.g. while charging).
+                println!("    battery: ?% ({:?})", b.status);
+            }
             Ok(Some(b)) => println!(
                 "    battery: {}% {:?} ({:?})",
                 b.percentage, b.level, b.status
             ),
-            Ok(None) => println!("    battery: 0% reported — treated as unknown"),
+            Ok(None) => println!("    battery: 0% discharging/unknown — treated as unknown"),
             Err(ref e) => println!("    battery: read failed — {e}"),
         }
     }
@@ -80,8 +84,9 @@ mod tests {
 
     fn format_legacy_line(summary: &BatteryFeatureSummary) -> String {
         match &summary.legacy_battery {
+            Ok(Some(b)) if b.percentage == 0 => format!("?% ({:?})", b.status),
             Ok(Some(b)) => format!("{}% {:?} ({:?})", b.percentage, b.level, b.status),
-            Ok(None) => "0% reported — treated as unknown".to_string(),
+            Ok(None) => "0% discharging/unknown — treated as unknown".to_string(),
             Err(e) => format!("read failed — {e}"),
         }
     }
@@ -133,7 +138,26 @@ mod tests {
             legacy_battery: Ok(None),
         };
         let line = format_legacy_line(&summary);
-        assert_eq!(line, "0% reported — treated as unknown");
+        assert_eq!(line, "0% discharging/unknown — treated as unknown");
+    }
+
+    #[test]
+    fn legacy_battery_zero_while_charging_shows_status() {
+        // While charging, the device reports 0% (percentage unknown) but a real
+        // charging status — show "?%" with the status, not a bogus "0%".
+        let summary = BatteryFeatureSummary {
+            battery_status_present: true,
+            battery_voltage_present: false,
+            unified_battery_present: false,
+            unified_battery: Ok(None),
+            legacy_battery: Ok(Some(BatteryInfo {
+                percentage: 0,
+                level: BatteryLevel::Unknown,
+                status: BatteryStatus::Charging,
+            })),
+        };
+        let line = format_legacy_line(&summary);
+        assert_eq!(line, "?% (Charging)");
     }
 
     #[test]

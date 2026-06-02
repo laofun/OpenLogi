@@ -421,7 +421,9 @@ async fn probe_legacy_battery(
     device: &Device,
     slot: u8,
 ) -> Option<BatteryInfo> {
-    use crate::battery_status::{BatteryStatusFeature, FEATURE_ID as BATTERY_STATUS_FEATURE_ID};
+    use crate::battery_status::{
+        BatteryStatusFeature, FEATURE_ID as BATTERY_STATUS_FEATURE_ID, is_informative,
+    };
     let info = device
         .root()
         .get_feature(BATTERY_STATUS_FEATURE_ID)
@@ -429,12 +431,14 @@ async fn probe_legacy_battery(
         .ok()??;
     let feature = BatteryStatusFeature::new(Arc::clone(channel), slot, info.index);
     match feature.get_battery_info().await {
-        // `0x1000` reports percentage 0 as "unknown" (firmware not ready, or a
-        // degraded just-woken read). Don't surface a bogus 0%/critical reading.
-        Ok(b) if b.percentage == 0 => {
+        // `0x1000` reports percentage 0 as "unknown" — but while charging the
+        // device returns 0% with a real charging status, so only drop a 0%
+        // reading that is also discharging/unknown (firmware not ready or a
+        // degraded just-woken read). See `battery_status::is_informative`.
+        Ok(b) if !is_informative(&b) => {
             debug!(
                 slot,
-                "BatteryStatus (0x1000) returned 0% — treating as unknown"
+                "BatteryStatus (0x1000) returned 0% discharging/unknown — treating as unknown"
             );
             None
         }
