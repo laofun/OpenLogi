@@ -370,7 +370,9 @@ async fn probe_features(
                 level: map_battery_level(info.level),
                 status: map_battery_status(info.status),
             }),
-        None => None,
+        // Fallback to 0x1000 BatteryStatus for devices like MX Master 2S that
+        // use the legacy feature instead of 0x1004 UnifiedBattery.
+        None => probe_legacy_battery(channel, &device, slot).await,
     };
 
     let model_info = match device.get_feature::<DeviceInformationFeature>() {
@@ -410,6 +412,29 @@ async fn probe_features(
     };
 
     (battery, model_info)
+}
+
+/// Try to read battery info via `0x1000 BatteryStatus` (legacy path).
+/// Returns `None` silently if the feature is absent or the read fails.
+async fn probe_legacy_battery(
+    channel: &Arc<HidppChannel>,
+    device: &Device,
+    slot: u8,
+) -> Option<BatteryInfo> {
+    use crate::battery_status::{BatteryStatusFeature, FEATURE_ID as BATTERY_STATUS_FEATURE_ID};
+    let info = device
+        .root()
+        .get_feature(BATTERY_STATUS_FEATURE_ID)
+        .await
+        .ok()??;
+    let feature = BatteryStatusFeature::new(Arc::clone(channel), slot, info.index);
+    match feature.get_battery_info().await {
+        Ok(b) => Some(b),
+        Err(e) => {
+            debug!(slot, error = ?e, "BatteryStatus (0x1000) read failed");
+            None
+        }
+    }
 }
 
 fn normalize_serial_number(serial: &str) -> Option<String> {
