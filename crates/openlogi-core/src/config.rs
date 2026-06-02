@@ -146,6 +146,11 @@ pub struct DeviceConfig {
     /// the cycle action becomes a no-op until the user adds at least one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dpi_presets: Vec<u32>,
+    /// Persisted SmartShift auto-disengage sensitivity (1–255). Applied to the
+    /// firmware by the GUI when the device connects. `None` = leave the
+    /// firmware value untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smartshift_sensitivity: Option<u8>,
 }
 
 #[derive(Debug, Error)]
@@ -361,6 +366,26 @@ impl Config {
             .or_default()
             .dpi_presets = presets;
     }
+
+    /// The persisted SmartShift auto-disengage sensitivity for `device_key`, or
+    /// `None` if the device has none configured. Values are 1–255; the GUI
+    /// applies this to the firmware on connect.
+    #[must_use]
+    pub fn smartshift_sensitivity(&self, device_key: &str) -> Option<u8> {
+        self.devices
+            .get(device_key)
+            .and_then(|d| d.smartshift_sensitivity)
+    }
+
+    /// Set (or clear, with `None`) the persisted SmartShift sensitivity for
+    /// `device_key`. `None` omits the field on save thanks to
+    /// `skip_serializing_if`; the device block itself is kept.
+    pub fn set_smartshift_sensitivity(&mut self, device_key: &str, value: Option<u8>) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .smartshift_sensitivity = value;
+    }
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -504,6 +529,46 @@ mod tests {
         assert!(
             !body.contains("dpi_presets"),
             "empty dpi_presets should be omitted: {body}"
+        );
+    }
+
+    #[test]
+    fn smartshift_sensitivity_roundtrip_per_device() {
+        let mut cfg = Config::default();
+        cfg.set_smartshift_sensitivity("2b042", Some(20));
+        cfg.set_smartshift_sensitivity("4082d", Some(255));
+
+        let parsed = write_and_read(&cfg);
+
+        assert_eq!(parsed.smartshift_sensitivity("2b042"), Some(20));
+        assert_eq!(parsed.smartshift_sensitivity("4082d"), Some(255));
+        assert_eq!(parsed.smartshift_sensitivity("unknown"), None);
+    }
+
+    #[test]
+    fn smartshift_sensitivity_none_skips_serialization() {
+        let mut cfg = Config::default();
+        // A binding makes the device block exist even with no sensitivity.
+        cfg.set_binding("2b042", ButtonId::Back, Action::Copy);
+        cfg.set_smartshift_sensitivity("2b042", Some(30));
+        cfg.set_smartshift_sensitivity("2b042", None); // clear
+
+        let body = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(
+            !body.contains("smartshift_sensitivity"),
+            "None must be omitted; got: {body}"
+        );
+    }
+
+    #[test]
+    fn smartshift_sensitivity_present_in_toml_when_set() {
+        let mut cfg = Config::default();
+        cfg.set_smartshift_sensitivity("2b042", Some(42));
+
+        let body = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(
+            body.contains("smartshift_sensitivity = 42"),
+            "got: {body}"
         );
     }
 
