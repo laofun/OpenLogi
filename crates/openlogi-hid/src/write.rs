@@ -9,7 +9,6 @@
 
 use std::sync::Arc;
 
-#[allow(unused_imports)]
 use hidpp::feature::smartshift::{SmartShiftFeature, WheelMode};
 use hidpp::{channel::HidppChannel, device::Device, feature::CreatableFeature};
 use thiserror::Error;
@@ -111,7 +110,6 @@ async fn open_feature<F: CreatableFeature + 'static>(
 /// trigger the `0x2110` legacy fallback. Only a missing-`0x2111` feature
 /// qualifies; transport and protocol errors propagate unchanged so a real
 /// failure is never masked by a second open attempt.
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_missing_enhanced(err: &WriteError) -> bool {
     matches!(
         err,
@@ -122,12 +120,79 @@ fn is_missing_enhanced(err: &WriteError) -> bool {
 /// Map the fork's `0x2110` [`WheelMode`] onto OpenLogi's [`SmartShiftMode`].
 /// A reserved/future variant maps to [`SmartShiftMode::Ratchet`], the "safe"
 /// clicky default OpenLogi uses elsewhere.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wheel_mode_to_smartshift(wheel: WheelMode) -> SmartShiftMode {
     if matches!(wheel, WheelMode::Freespin) {
         SmartShiftMode::Free
     } else {
         SmartShiftMode::Ratchet
+    }
+}
+
+/// Whichever SmartShift feature a device exposes, normalised onto
+/// [`SmartShiftMode`]. Devices ship one or the other: MX Master 3 / 3S use the
+/// `0x2111` Enhanced variant, the MX Master 2S uses the original `0x2110`.
+enum SmartShift {
+    /// `0x2111 SmartShiftWheelEnhanced`.
+    Enhanced(Arc<SmartShiftFeatureV0>),
+    /// `0x2110 SmartShiftWheel`.
+    Legacy(Arc<SmartShiftFeature>),
+}
+
+impl SmartShift {
+    /// Open whichever SmartShift feature the device exposes. Tries `0x2111`
+    /// first; on a missing-`0x2111` error (and only that), retries with
+    /// `0x2110`. Any other error from the first attempt propagates unchanged.
+    async fn open(device: &mut Device) -> Result<Self, WriteError> {
+        match open_feature::<SmartShiftFeatureV0>(device).await {
+            Ok(feature) => Ok(Self::Enhanced(feature)),
+            Err(err) if is_missing_enhanced(&err) => {
+                let feature = open_feature::<SmartShiftFeature>(device).await?;
+                Ok(Self::Legacy(feature))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Read the current mode (and, for Enhanced, the sensitivity; for Legacy,
+    /// the auto-disengage threshold reported as `sensitivity`).
+    async fn status(&self) -> Result<SmartShiftStatus, WriteError> {
+        match self {
+            Self::Enhanced(feature) => feature
+                .get_status()
+                .await
+                .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
+            Self::Legacy(feature) => {
+                let rcm = feature
+                    .get_ratchet_control_mode()
+                    .await
+                    .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+                Ok(SmartShiftStatus {
+                    mode: wheel_mode_to_smartshift(rcm.wheel_mode),
+                    sensitivity: rcm.auto_disengage,
+                })
+            }
+        }
+    }
+
+    /// Write a new mode. `sensitivity` is preserved on Enhanced; on Legacy the
+    /// auto-disengage threshold is left unchanged (`None`).
+    async fn set_mode(&self, mode: SmartShiftMode, sensitivity: u8) -> Result<(), WriteError> {
+        match self {
+            Self::Enhanced(feature) => feature
+                .set_status(mode, sensitivity)
+                .await
+                .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
+            Self::Legacy(feature) => {
+                let wheel = match mode {
+                    SmartShiftMode::Free => WheelMode::Freespin,
+                    SmartShiftMode::Ratchet => WheelMode::Ratchet,
+                };
+                feature
+                    .set_ratchet_control_mode(Some(wheel), None, None)
+                    .await
+                    .map_err(|e| WriteError::Hidpp(format!("{e:?}")))
+            }
+        }
     }
 }
 
@@ -157,11 +222,8 @@ pub async fn get_smartshift_status(route: &DeviceRoute) -> Result<SmartShiftStat
         let mut device = Device::new(Arc::clone(&channel), index)
             .await
             .map_err(|_| WriteError::DeviceUnreachable { index })?;
-        let feature = open_feature::<SmartShiftFeatureV0>(&mut device).await?;
-        feature
-            .get_status()
-            .await
-            .map_err(|e| WriteError::Hidpp(format!("{e:?}")))
+        let smartshift = SmartShift::open(&mut device).await?;
+        smartshift.status().await
     })
     .await
 }
@@ -217,8 +279,9 @@ async fn set_dpi_on_channel(
 /// mode first, then writes the opposite — keeps current sensitivity.
 /// Returns the new mode written.
 ///
-/// `FeatureUnsupported` when the device doesn't expose HID++ `0x2111`
-/// (older Logi mice and most non-MX devices).
+/// `FeatureUnsupported` when the device exposes neither HID++ `0x2111`
+/// (MX Master 3 / 3S) nor the older `0x2110` (MX Master 2S) — i.e. it has no
+/// SmartShift wheel.
 pub async fn toggle_smartshift(route: &DeviceRoute) -> Result<SmartShiftMode, WriteError> {
     let index = route.device_index();
     with_route(route, move |channel| async move {
@@ -236,16 +299,10 @@ async fn toggle_smartshift_on_channel(
     let mut device = Device::new(Arc::clone(channel), index)
         .await
         .map_err(|_| WriteError::DeviceUnreachable { index })?;
-    let feature = open_feature::<SmartShiftFeatureV0>(&mut device).await?;
-    let SmartShiftStatus { mode, sensitivity } = feature
-        .get_status()
-        .await
-        .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+    let smartshift = SmartShift::open(&mut device).await?;
+    let SmartShiftStatus { mode, sensitivity } = smartshift.status().await?;
     let next = mode.flipped();
-    feature
-        .set_status(next, sensitivity)
-        .await
-        .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+    smartshift.set_mode(next, sensitivity).await?;
     debug!(index, ?next, "wrote SmartShift mode");
     Ok(next)
 }
