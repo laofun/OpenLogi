@@ -258,15 +258,11 @@ fn main() -> Result<()> {
                             writes
                         });
                         // Off the GPUI thread: re-apply each connected device's
-                        // persisted SmartShift sensitivity (fresh channel,
-                        // capture = None). Once per connection — see
+                        // persisted SmartShift sensitivity (fresh channel).
+                        // Once per connection — see
                         // AppState::pending_smartshift_writes.
                         for (route, value) in writes {
-                            hardware::apply_smartshift_sensitivity_in_background(
-                                None,
-                                Some(route),
-                                value,
-                            );
+                            hardware::apply_smartshift_sensitivity_in_background(Some(route), value);
                         }
                     }
                     Some(bundle) = app_rx.recv() => {

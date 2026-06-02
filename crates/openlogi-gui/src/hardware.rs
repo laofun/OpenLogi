@@ -91,12 +91,12 @@ pub fn toggle_smartshift_in_background(
 /// older `0x2110` SmartShift feature) are logged, never retried within the
 /// call.
 ///
+/// Unlike the toggle/DPI writers this always opens a fresh channel — there is
+/// no channel-reusing `set_smartshift_sensitivity_on` variant, and the sole
+/// caller (inventory refresh) runs with no capture session bound.
+///
 /// `target == None` is a no-op (dev environment without a real device).
-pub fn apply_smartshift_sensitivity_in_background(
-    capture: Option<&CaptureChannel>,
-    target: Option<DeviceRoute>,
-    value: u8,
-) {
+pub fn apply_smartshift_sensitivity_in_background(target: Option<DeviceRoute>, value: u8) {
     let Some(target) = target else {
         debug!(
             value,
@@ -104,10 +104,6 @@ pub fn apply_smartshift_sensitivity_in_background(
         );
         return;
     };
-    // Auto-apply opens a fresh channel (capture = None / non-matching is fine);
-    // the read here keeps the call shape identical to the toggle/DPI writers.
-    let shared = reusable_channel(capture, &target);
-    let reused = shared.is_some();
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -132,7 +128,6 @@ pub fn apply_smartshift_sensitivity_in_background(
                 index,
                 value,
                 applied = status.sensitivity,
-                reused,
                 "SmartShift sensitivity applied"
             ),
             Ok(Err(e)) => warn!(error = ?e, "SmartShift sensitivity apply failed"),
