@@ -287,6 +287,10 @@ pub struct DeviceConfig {
     /// firmware value untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smartshift_sensitivity: Option<u8>,
+    /// Persisted desired SmartShift wheel mode. `Some(true)` = ratchet / SmartShift
+    /// mode; `Some(false)` = free-spin mode; `None` = leave firmware state untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smartshift_ratchet_mode: Option<bool>,
 }
 
 #[derive(Debug, Error)]
@@ -532,6 +536,24 @@ impl Config {
             .entry(device_key.to_string())
             .or_default()
             .smartshift_sensitivity = value;
+    }
+
+    /// The persisted desired SmartShift mode for `device_key`. `Some(true)` means
+    /// ratchet / SmartShift mode, `Some(false)` means free-spin, and `None` means no
+    /// preference has been stored.
+    #[must_use]
+    pub fn smartshift_ratchet_mode(&self, device_key: &str) -> Option<bool> {
+        self.devices
+            .get(device_key)
+            .and_then(|d| d.smartshift_ratchet_mode)
+    }
+
+    /// Set (or clear, with `None`) the desired SmartShift mode for `device_key`.
+    pub fn set_smartshift_ratchet_mode(&mut self, device_key: &str, value: Option<bool>) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .smartshift_ratchet_mode = value;
     }
 }
 
@@ -786,6 +808,21 @@ step = 12.5
 
         let body = toml::to_string_pretty(&cfg).expect("serialize");
         assert!(body.contains("smartshift_sensitivity = 42"), "got: {body}");
+    }
+
+    #[test]
+    fn smartshift_ratchet_mode_roundtrip_per_device() {
+        let mut cfg = Config::default();
+        cfg.set_smartshift_ratchet_mode("0b019", Some(true));
+        cfg.set_smartshift_sensitivity("0b019", Some(25));
+        cfg.set_smartshift_ratchet_mode("other", Some(false));
+
+        let parsed = write_and_read(&cfg);
+
+        assert_eq!(parsed.smartshift_ratchet_mode("0b019"), Some(true));
+        assert_eq!(parsed.smartshift_sensitivity("0b019"), Some(25));
+        assert_eq!(parsed.smartshift_ratchet_mode("other"), Some(false));
+        assert_eq!(parsed.smartshift_ratchet_mode("missing"), None);
     }
 
     #[test]
