@@ -75,6 +75,12 @@ pub enum DpiStatus {
     Unsupported(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingSmartShift {
+    pub ratchet_mode: Option<bool>,
+    pub sensitivity: Option<u8>,
+}
+
 pub struct AppState {
     /// Index into [`Self::device_list`] of the currently visible device. May
     /// be out of bounds briefly while inventories re-enumerate; views must
@@ -270,9 +276,9 @@ impl AppState {
         self.device_list.get(self.current_device)
     }
 
-    /// Compute and register the SmartShift sensitivities that must be written
-    /// to freshly-connected devices, returning the `(route, value)` pairs the
-    /// caller dispatches to [`crate::hardware::apply_smartshift_sensitivity_in_background`].
+    /// Compute and register the SmartShift settings that must be written
+    /// to freshly-connected devices, returning the pending values keyed by route
+    /// for the caller to dispatch to the background hardware writers.
     ///
     /// Behaviour:
     /// - **Disk is the source of truth.** Reads the persisted value from a
@@ -294,7 +300,7 @@ impl AppState {
     ///   returns early without touching the disk.
     ///
     /// Call this on every inventory refresh, after `refresh_inventories`.
-    pub fn pending_smartshift_writes(&mut self) -> Vec<(DeviceRoute, u8)> {
+    pub fn pending_smartshift_writes(&mut self) -> Vec<(DeviceRoute, PendingSmartShift)> {
         // Connected = online records that carry a route (offline records can't
         // be written to).
         let connected: Vec<String> = self
@@ -321,16 +327,20 @@ impl AppState {
         let pending = smartshift_pending(&disk, &connected, &self.smartshift_applied);
 
         let mut writes = Vec::new();
-        for (key, value) in pending {
-            // Sync into the in-memory config so a later full-file save keeps it.
-            self.config.set_smartshift_sensitivity(&key, Some(value));
+        for (key, pending) in pending {
+            if let Some(mode) = pending.ratchet_mode {
+                self.config.set_smartshift_ratchet_mode(&key, Some(mode));
+            }
+            if let Some(value) = pending.sensitivity {
+                self.config.set_smartshift_sensitivity(&key, Some(value));
+            }
             if let Some(route) = self
                 .device_list
                 .iter()
                 .find(|r| r.config_key == key)
                 .and_then(|r| r.route.clone())
             {
-                writes.push((route, value));
+                writes.push((route, pending));
             }
         }
 
@@ -519,6 +529,40 @@ impl AppState {
         self.config.set_scroll_settings(settings);
         if let Err(e) = self.config.save_atomic() {
             warn!(error = %e, "could not persist scroll settings");
+        }
+    }
+
+    #[must_use]
+    pub fn active_smartshift_ratchet_mode(&self) -> Option<bool> {
+        self.current_record()
+            .and_then(|record| self.config.smartshift_ratchet_mode(&record.config_key))
+    }
+
+    #[must_use]
+    pub fn active_smartshift_sensitivity(&self) -> Option<u8> {
+        self.current_record()
+            .and_then(|record| self.config.smartshift_sensitivity(&record.config_key))
+    }
+
+    pub fn commit_active_smartshift_ratchet_mode(&mut self, value: bool) {
+        let Some(key) = self.current_record().map(|r| r.config_key.clone()) else {
+            debug!("no active device key — SmartShift mode not persisted");
+            return;
+        };
+        self.config.set_smartshift_ratchet_mode(&key, Some(value));
+        if let Err(e) = self.config.save_atomic() {
+            warn!(error = %e, "could not persist SmartShift mode");
+        }
+    }
+
+    pub fn commit_active_smartshift_sensitivity(&mut self, value: u8) {
+        let Some(key) = self.current_record().map(|r| r.config_key.clone()) else {
+            debug!("no active device key — SmartShift sensitivity not persisted");
+            return;
+        };
+        self.config.set_smartshift_sensitivity(&key, Some(value));
+        if let Err(e) = self.config.save_atomic() {
+            warn!(error = %e, "could not persist SmartShift sensitivity");
         }
     }
 
@@ -941,9 +985,8 @@ impl AppState {
 impl Global for AppState {}
 
 /// Given the persisted config, the `config_key`s currently connected, and the
-/// set already evaluated this session, return the `(config_key, value)` pairs
-/// that still need a firmware write. Skips devices with no persisted value and
-/// any stored `0` (a device no-op). Pure — no I/O, fully unit-testable.
+/// set already evaluated this session, return the `(config_key, pending)` pairs
+/// that still need firmware writes. Pure — no I/O, fully unit-testable.
 ///
 /// The caller ([`AppState::pending_smartshift_writes`]) is responsible for
 /// pruning `already_applied` of keys no longer connected so a reconnect
@@ -951,16 +994,18 @@ impl Global for AppState {}
 fn smartshift_pending(
     config: &Config,
     connected: &[String],
-    already_applied: &HashSet<String>,
-) -> Vec<(String, u8)> {
+    applied: &HashSet<String>,
+) -> Vec<(String, PendingSmartShift)> {
     connected
         .iter()
-        .filter(|key| !already_applied.contains(*key))
+        .filter(|key| !applied.contains(*key))
         .filter_map(|key| {
-            config
-                .smartshift_sensitivity(key)
-                .filter(|&v| v != 0)
-                .map(|v| (key.clone(), v))
+            let pending = PendingSmartShift {
+                ratchet_mode: config.smartshift_ratchet_mode(key),
+                sensitivity: config.smartshift_sensitivity(key).filter(|&v| v != 0),
+            };
+            (pending.ratchet_mode.is_some() || pending.sensitivity.is_some())
+                .then(|| (key.clone(), pending))
         })
         .collect()
 }
@@ -1104,7 +1149,16 @@ mod tests {
         let mut cfg = Config::default();
         cfg.set_smartshift_sensitivity("2b042", Some(20));
         let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &HashSet::new());
-        assert_eq!(pending, vec![("2b042".to_string(), 20)]);
+        assert_eq!(
+            pending,
+            vec![(
+                "2b042".to_string(),
+                PendingSmartShift {
+                    ratchet_mode: None,
+                    sensitivity: Some(20),
+                },
+            )]
+        );
     }
 
     #[test]
@@ -1132,13 +1186,39 @@ mod tests {
     }
 
     #[test]
+    fn pending_keeps_mode_when_stored_sensitivity_is_zero() {
+        let mut cfg = Config::default();
+        cfg.set_smartshift_ratchet_mode("2b042", Some(true));
+        cfg.set_smartshift_sensitivity("2b042", Some(0)); // stored zero remains a no-op
+        let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &HashSet::new());
+        assert_eq!(
+            pending,
+            vec![(
+                "2b042".to_string(),
+                PendingSmartShift {
+                    ratchet_mode: Some(true),
+                    sensitivity: None,
+                },
+            )]
+        );
+    }
+
     fn pending_reapplies_after_key_pruned_from_applied() {
         let mut cfg = Config::default();
         cfg.set_smartshift_sensitivity("2b042", Some(20));
         // Simulate a reconnect: the key was applied, then pruned (disconnect).
         let applied = HashSet::new();
         let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &applied);
-        assert_eq!(pending, vec![("2b042".to_string(), 20)]);
+        assert_eq!(
+            pending,
+            vec![(
+                "2b042".to_string(),
+                PendingSmartShift {
+                    ratchet_mode: None,
+                    sensitivity: Some(20),
+                },
+            )]
+        );
     }
 
     #[test]
@@ -1148,6 +1228,43 @@ mod tests {
         cfg.set_smartshift_sensitivity("4082d", Some(255));
         let applied: HashSet<String> = ["2b042".to_string()].into_iter().collect();
         let pending = smartshift_pending(&cfg, &keys(&["2b042", "4082d"]), &applied);
-        assert_eq!(pending, vec![("4082d".to_string(), 255)]);
+        assert_eq!(
+            pending,
+            vec![(
+                "4082d".to_string(),
+                PendingSmartShift {
+                    ratchet_mode: None,
+                    sensitivity: Some(255),
+                },
+            )]
+        );
+    }
+
+    #[test]
+    fn smartshift_pending_collects_mode_and_sensitivity_once() {
+        let mut cfg = Config::default();
+        cfg.set_smartshift_ratchet_mode("0b019", Some(true));
+        cfg.set_smartshift_sensitivity("0b019", Some(25));
+        let connected = vec!["0b019".to_string()];
+        let applied = HashSet::new();
+
+        let pending = smartshift_pending(&cfg, &connected, &applied);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "0b019");
+        assert_eq!(pending[0].1.ratchet_mode, Some(true));
+        assert_eq!(pending[0].1.sensitivity, Some(25));
+    }
+
+    #[test]
+    fn smartshift_pending_skips_already_evaluated_devices() {
+        let mut cfg = Config::default();
+        cfg.set_smartshift_ratchet_mode("0b019", Some(false));
+        let connected = vec!["0b019".to_string()];
+        let applied = HashSet::from(["0b019".to_string()]);
+
+        let pending = smartshift_pending(&cfg, &connected, &applied);
+
+        assert!(pending.is_empty());
     }
 }

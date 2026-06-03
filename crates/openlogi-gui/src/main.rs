@@ -257,11 +257,21 @@ fn main() -> Result<()> {
                             writes
                         });
                         // Off the GPUI thread: re-apply each connected device's
-                        // persisted SmartShift sensitivity (fresh channel).
+                        // persisted SmartShift settings (fresh channel).
                         // Once per connection — see
                         // AppState::pending_smartshift_writes.
-                        for (route, value) in writes {
-                            hardware::apply_smartshift_sensitivity_in_background(Some(route), value);
+                        for (route, pending) in writes {
+                            if let Some(ratchet_mode) = pending.ratchet_mode {
+                                let mode = if ratchet_mode {
+                                    openlogi_hid::SmartShiftMode::Ratchet
+                                } else {
+                                    openlogi_hid::SmartShiftMode::Free
+                                };
+                                hardware::set_smartshift_mode_in_background(None, Some(route.clone()), mode);
+                            }
+                            if let Some(value) = pending.sensitivity {
+                                hardware::apply_smartshift_sensitivity_in_background(Some(route), value);
+                            }
                         }
                     }
                     Some(bundle) = app_rx.recv() => {
