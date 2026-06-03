@@ -44,6 +44,24 @@ To install the CLI binary on `PATH`:
 cargo install --path .
 ```
 
+## Make targets
+
+A top-level `Makefile` wraps the common cargo / xtask / scripts incantations —
+handy shortcuts, not a required build step (`cargo` works directly). Run
+`make help` for the full list. The ones worth knowing:
+
+```sh
+make check        # fmt + clippy + tests (the pre-commit gate)
+make gui          # build + run the desktop app (release, signed dev bundle)
+make sign-setup   # one-time: create the dev signing cert (persists TCC grants)
+make diag-mx2s    # MX Master 2S diag sweep: battery 0x1000, SmartShift 0x2110, DPI
+make install      # bundle + sign + install OpenLogi.app into /Applications
+```
+
+`make install` is the everyday path for using the app with a real device: it
+builds the release `OpenLogi.app`, signs it with the `OpenLogi Dev` cert (so the
+TCC grants survive reinstalls — see below), and copies it into `/Applications`.
+
 ## Using devenv (macOS)
 
 The repo's `devenv.nix` provisions a Nix-based dev shell with sccache, the
