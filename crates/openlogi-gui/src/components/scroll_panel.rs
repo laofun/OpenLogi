@@ -8,8 +8,9 @@
 //! opened (see `main.rs`'s post-grant push).
 
 use gpui::{
-    AppContext as _, BorrowAppContext as _, Context, Entity, IntoElement, ParentElement, Render,
-    SharedString, Styled, Subscription, Window, div, px,
+    AppContext as _, BorrowAppContext as _, Context, Entity, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled, Subscription,
+    Window, div, px,
 };
 use gpui_component::{
     h_flex,
@@ -134,6 +135,29 @@ impl ScrollPanel {
         });
     }
 
+    /// Reset every scroll knob to [`ScrollSettings::default`], re-seat the four
+    /// slider thumbs to match, then apply + persist like any other edit. The
+    /// toggle switches read `self.settings` directly in `render`, so `cx.notify`
+    /// alone refreshes them.
+    fn reset_to_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let defaults = ScrollSettings::default();
+        // Re-seat each thumb to its default (reborrow `window` per iteration so
+        // all four `update` calls can use it). Read the values before the move so
+        // the slider borrows don't alias `self.settings`.
+        let thumbs = [
+            (&self.speed, defaults.speed),
+            (&self.step, defaults.step),
+            (&self.duration, defaults.duration),
+            (&self.dead_zone, defaults.dead_zone),
+        ];
+        for (state, value) in thumbs {
+            state.update(cx, |s, cx| s.set_value(f64_to_f32(value), &mut *window, cx));
+        }
+        self.settings = defaults;
+        self.on_change(cx);
+        cx.notify();
+    }
+
     /// One labelled boolean toggle row. `set` writes the toggled value back into
     /// `ScrollSettings`, then [`Self::on_change`] applies + persists it.
     fn toggle_row(
@@ -222,6 +246,19 @@ impl Render for ScrollPanel {
                 &self.dead_zone,
                 pal,
             ))
+            // Reset-to-defaults action, styled like the other inline text actions.
+            .child(
+                div()
+                    .id("scroll-reset")
+                    .text_sm()
+                    .text_color(pal.text_muted)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(pal.text_primary))
+                    .child(tr!("Reset to defaults"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.reset_to_defaults(window, cx);
+                    })),
+            )
     }
 }
 
