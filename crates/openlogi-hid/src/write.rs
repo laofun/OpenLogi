@@ -398,6 +398,36 @@ pub async fn toggle_smartshift(route: &DeviceRoute) -> Result<SmartShiftMode, Wr
     .await
 }
 
+/// Set SmartShift mode on `route` to a known desired state, preserving current
+/// sensitivity. Use this for persisted settings; unlike `toggle_smartshift`, it
+/// never depends on the current mode matching UI state.
+pub async fn set_smartshift_mode(
+    route: &DeviceRoute,
+    mode: SmartShiftMode,
+) -> Result<SmartShiftStatus, WriteError> {
+    let index = route.device_index();
+    with_route(route, move |channel| async move {
+        set_smartshift_mode_on_channel(&channel, index, mode).await
+    })
+    .await
+}
+
+async fn set_smartshift_mode_on_channel(
+    channel: &Arc<HidppChannel>,
+    index: u8,
+    mode: SmartShiftMode,
+) -> Result<SmartShiftStatus, WriteError> {
+    let mut device = Device::new(Arc::clone(channel), index)
+        .await
+        .map_err(|_| WriteError::DeviceUnreachable { index })?;
+    let smartshift = SmartShift::open(&mut device).await?;
+    let SmartShiftStatus { sensitivity, .. } = smartshift.status().await?;
+    smartshift.set_mode(mode, sensitivity).await?;
+    let status = smartshift.status().await?;
+    debug!(index, ?mode, applied = ?status.mode, "wrote SmartShift mode");
+    Ok(status)
+}
+
 /// The SmartShift toggle itself, on an already-open channel at HID++ `index`.
 /// Shared by [`toggle_smartshift`] and [`toggle_smartshift_on`].
 async fn toggle_smartshift_on_channel(
@@ -452,6 +482,14 @@ pub async fn set_dpi_on(shared: &SharedChannel, dpi: u16) -> Result<(), WriteErr
 /// Toggle SmartShift on an already-open [`SharedChannel`].
 pub async fn toggle_smartshift_on(shared: &SharedChannel) -> Result<SmartShiftMode, WriteError> {
     toggle_smartshift_on_channel(&shared.channel, shared.route.device_index()).await
+}
+
+/// Set SmartShift mode on an already-open [`SharedChannel`].
+pub async fn set_smartshift_mode_on(
+    shared: &SharedChannel,
+    mode: SmartShiftMode,
+) -> Result<SmartShiftStatus, WriteError> {
+    set_smartshift_mode_on_channel(&shared.channel, shared.route.device_index(), mode).await
 }
 
 /// Boilerplate-eater: open the channel that reaches `route`, then run `f` once
@@ -524,5 +562,17 @@ mod tests {
         assert_eq!(caps.adjacent_test_target(1000), Some(1600));
         assert_eq!(caps.adjacent_test_target(2000), Some(1600));
         Ok(())
+    }
+
+    #[test]
+    fn smartshift_mode_setters_have_expected_api_shape() {
+        fn _route_api(route: &DeviceRoute) {
+            let fut = set_smartshift_mode(route, SmartShiftMode::Ratchet);
+            std::mem::drop(fut);
+        }
+        fn _shared_api(shared: &SharedChannel) {
+            let fut = set_smartshift_mode_on(shared, SmartShiftMode::Free);
+            std::mem::drop(fut);
+        }
     }
 }

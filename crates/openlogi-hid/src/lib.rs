@@ -34,6 +34,7 @@ pub use route::{DIRECT_DEVICE_INDEX, DeviceRoute};
 pub use smartshift::{SmartShiftMode, SmartShiftStatus};
 pub use write::{
     DpiCapabilities, DpiInfo, FeatureEntry, SharedChannel, WriteError, dump_features, get_dpi,
-    get_dpi_info, get_smartshift_status, set_dpi, set_dpi_on, set_smartshift_sensitivity,
-    toggle_smartshift, toggle_smartshift_on,
+    get_dpi_info, get_smartshift_status, set_dpi, set_dpi_on, set_smartshift_mode,
+    set_smartshift_mode_on, set_smartshift_sensitivity, toggle_smartshift,
+    toggle_smartshift_on,
 };
