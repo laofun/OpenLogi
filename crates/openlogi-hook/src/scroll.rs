@@ -263,7 +263,9 @@ mod tests {
                 vertical_step: 1.0,
             },
         );
-        let (dx, dy) = e.advance(1.0, 0.1).expect("frame");
+        let Some((dx, dy)) = e.advance(1.0, 0.1) else {
+            panic!("frame");
+        };
         assert!((dx - 2.0).abs() < f64::EPSILON);
         assert!((dy - 4.0).abs() < f64::EPSILON);
     }
@@ -281,7 +283,9 @@ mod tests {
                 vertical_step: 7.0,
             },
         );
-        let (dx, dy) = e.advance(1.0, 0.1).expect("frame");
+        let Some((dx, dy)) = e.advance(1.0, 0.1) else {
+            panic!("frame");
+        };
         assert!((dx - 3.0).abs() < f64::EPSILON);
         assert!((dy - 7.0).abs() < f64::EPSILON);
     }
@@ -304,8 +308,12 @@ mod tests {
     fn push_starts_only_when_idle() {
         let s = SharedSmooth::new();
         let starts = Cell::new(0u32);
-        s.push(0.0, 10.0, default_tuning(), 1, || starts.set(starts.get() + 1)); // idle → start
-        s.push(0.0, 10.0, default_tuning(), 1, || starts.set(starts.get() + 1)); // running → no start
+        s.push(0.0, 10.0, default_tuning(), 1, || {
+            starts.set(starts.get() + 1);
+        }); // idle → start
+        s.push(0.0, 10.0, default_tuning(), 1, || {
+            starts.set(starts.get() + 1);
+        }); // running → no start
         assert_eq!(starts.get(), 1);
     }
 

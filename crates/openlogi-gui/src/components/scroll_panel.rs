@@ -8,8 +8,7 @@
 use gpui::{
     AppContext as _, BorrowAppContext as _, Context, Entity, InteractiveElement, IntoElement,
     ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled, Subscription,
-    Window, div, px,
-    prelude::FluentBuilder as _,
+    Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     h_flex,
@@ -62,8 +61,7 @@ impl ScrollPanel {
         let dead_zone = cx.new(|_| dead_zone_slider_state(settings.dead_zone));
         let smartshift_default = cx
             .try_global::<AppState>()
-            .map(smartshift_percent_from_state)
-            .unwrap_or_else(default_smartshift_percent);
+            .map_or_else(default_smartshift_percent, smartshift_percent_from_state);
         let smartshift_sensitivity =
             cx.new(|_| smartshift_slider_state(f32::from(smartshift_default)));
 
@@ -88,11 +86,9 @@ impl ScrollPanel {
             &horizontal_step,
             |settings, value| settings.horizontal_step = f64::from(value),
         ));
-        subs.push(subscribe_scroll_slider(
-            cx,
-            &duration,
-            |settings, value| settings.duration = f64::from(value),
-        ));
+        subs.push(subscribe_scroll_slider(cx, &duration, |settings, value| {
+            settings.duration = f64::from(value);
+        }));
         subs.push(subscribe_scroll_slider(
             cx,
             &dead_zone,
@@ -100,9 +96,9 @@ impl ScrollPanel {
         ));
         subs.push(cx.subscribe(
             &smartshift_sensitivity,
-            |this, _slider, event: &SliderEvent, cx| {
+            |_this, _slider, event: &SliderEvent, cx| {
                 if let SliderEvent::Release(value) = event {
-                    this.apply_smartshift_sensitivity_release(value.start(), cx);
+                    Self::apply_smartshift_sensitivity_release(value.start(), cx);
                 }
             },
         ));
@@ -150,8 +146,7 @@ impl ScrollPanel {
     fn sync_smartshift_slider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let percent = cx
             .try_global::<AppState>()
-            .map(smartshift_percent_from_state)
-            .unwrap_or_else(default_smartshift_percent);
+            .map_or_else(default_smartshift_percent, smartshift_percent_from_state);
         self.smartshift_sensitivity.update(cx, |state, cx| {
             let target = f32::from(percent);
             if smartshift_slider_needs_sync(state.value().start(), target) {
@@ -160,7 +155,7 @@ impl ScrollPanel {
         });
     }
 
-    fn apply_smartshift_sensitivity_release(&mut self, percent: f32, cx: &mut Context<Self>) {
+    fn apply_smartshift_sensitivity_release(percent: f32, cx: &mut Context<Self>) {
         let (ratchet_mode, target) = active_smartshift_snapshot(cx);
         if !ratchet_mode {
             // Re-seat from persisted state on the next render when a window is available.
@@ -177,10 +172,12 @@ impl ScrollPanel {
         cx.notify();
     }
 
-    fn set_ratchet_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        let target = cx
-            .try_global::<AppState>()
-            .and_then(|state| state.current_record().and_then(|record| record.route.clone()));
+    fn set_ratchet_mode(enabled: bool, cx: &mut Context<Self>) {
+        let target = cx.try_global::<AppState>().and_then(|state| {
+            state
+                .current_record()
+                .and_then(|record| record.route.clone())
+        });
         let mode = if enabled {
             SmartShiftMode::Ratchet
         } else {
@@ -216,6 +213,10 @@ impl ScrollPanel {
 }
 
 impl Render for ScrollPanel {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "right-column settings panel composes several small grouped sections inline"
+    )]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_smartshift_slider(window, cx);
         let pal = theme::palette(cx);
@@ -226,151 +227,143 @@ impl Render for ScrollPanel {
             .gap_4()
             .w(px(PANEL_W))
             .child(div().text_sm().text_color(pal.text_muted).child("SCROLL"))
-            .child(
-                section(
-                    tr!("VERTICAL WHEEL"),
-                    v_flex()
-                        .gap_3()
-                        .child(Self::toggle_row(
-                            "scroll-invert-v",
-                            tr!("Invert vertical"),
-                            self.settings.reverse_vertical,
-                            |s, v| s.reverse_vertical = v,
-                            pal,
-                            cx,
-                        ))
-                        .child(Self::toggle_row(
-                            "scroll-smooth-v",
-                            tr!("Smooth vertical"),
-                            self.settings.smooth_vertical,
-                            |s, v| s.smooth_vertical = v,
-                            pal,
-                            cx,
-                        ))
-                        .child(slider_row(
-                            tr!("Speed"),
-                            self.settings.vertical_speed,
-                            &self.vertical_speed,
-                            pal,
-                            false,
-                        ))
-                        .child(slider_row(
-                            tr!("Step"),
-                            self.settings.vertical_step,
-                            &self.vertical_step,
-                            pal,
-                            false,
-                        )),
-                    pal,
-                ),
-            )
-            .child(
-                section(
-                    tr!("THUMB WHEEL / HORIZONTAL"),
-                    v_flex()
-                        .gap_3()
-                        .child(Self::toggle_row(
-                            "scroll-invert-h",
-                            tr!("Invert horizontal"),
-                            self.settings.reverse_horizontal,
-                            |s, v| s.reverse_horizontal = v,
-                            pal,
-                            cx,
-                        ))
-                        .child(Self::toggle_row(
-                            "scroll-smooth-h",
-                            tr!("Smooth horizontal"),
-                            self.settings.smooth_horizontal,
-                            |s, v| s.smooth_horizontal = v,
-                            pal,
-                            cx,
-                        ))
-                        .child(slider_row(
-                            tr!("Speed"),
-                            self.settings.horizontal_speed,
-                            &self.horizontal_speed,
-                            pal,
-                            false,
-                        ))
-                        .child(slider_row(
-                            tr!("Step"),
-                            self.settings.horizontal_step,
-                            &self.horizontal_step,
-                            pal,
-                            false,
-                        )),
-                    pal,
-                ),
-            )
-            .child(
-                section(
-                    tr!("SMOOTH FEEL"),
-                    v_flex()
-                        .gap_3()
-                        .child(Self::toggle_row(
-                            "scroll-smooth",
-                            tr!("Smooth scrolling"),
-                            self.settings.smooth,
-                            |s, v| s.smooth = v,
-                            pal,
-                            cx,
-                        ))
-                        .child(slider_row(
-                            tr!("Duration"),
-                            self.settings.duration,
-                            &self.duration,
-                            pal,
-                            false,
-                        ))
-                        .child(slider_row(
-                            tr!("Dead zone"),
-                            self.settings.dead_zone,
-                            &self.dead_zone,
-                            pal,
-                            false,
-                        )),
-                    pal,
-                ),
-            )
-            .child(
-                section(
-                    tr!("SMARTSHIFT"),
-                    v_flex()
-                        .gap_3()
-                        .child(
-                            h_flex()
-                                .justify_between()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(pal.text_primary)
-                                        .child(tr!("Ratchet mode")),
-                                )
-                                .child(Switch::new("smartshift-ratchet").checked(ratchet_mode).on_click(
-                                    cx.listener(|this, checked: &bool, _window, cx| {
-                                        this.set_ratchet_mode(*checked, cx);
-                                    }),
-                                )),
-                        )
-                        .child(slider_row(
-                            tr!("SmartShift sensitivity"),
-                            f64::from(smartshift_percent),
-                            &self.smartshift_sensitivity,
-                            pal,
-                            smartshift_disabled,
-                        ))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(pal.text_muted)
-                                .child(tr!(
-                                    "Sensitivity applies only while Ratchet mode is on."
-                                )),
-                        ),
-                    pal,
-                ),
-            )
+            .child(section(
+                tr!("VERTICAL WHEEL"),
+                v_flex()
+                    .gap_3()
+                    .child(Self::toggle_row(
+                        "scroll-invert-v",
+                        tr!("Invert vertical"),
+                        self.settings.reverse_vertical,
+                        |s, v| s.reverse_vertical = v,
+                        pal,
+                        cx,
+                    ))
+                    .child(Self::toggle_row(
+                        "scroll-smooth-v",
+                        tr!("Smooth vertical"),
+                        self.settings.smooth_vertical,
+                        |s, v| s.smooth_vertical = v,
+                        pal,
+                        cx,
+                    ))
+                    .child(slider_row(
+                        tr!("Speed"),
+                        self.settings.vertical_speed,
+                        &self.vertical_speed,
+                        pal,
+                        false,
+                    ))
+                    .child(slider_row(
+                        tr!("Step"),
+                        self.settings.vertical_step,
+                        &self.vertical_step,
+                        pal,
+                        false,
+                    )),
+                pal,
+            ))
+            .child(section(
+                tr!("THUMB WHEEL / HORIZONTAL"),
+                v_flex()
+                    .gap_3()
+                    .child(Self::toggle_row(
+                        "scroll-invert-h",
+                        tr!("Invert horizontal"),
+                        self.settings.reverse_horizontal,
+                        |s, v| s.reverse_horizontal = v,
+                        pal,
+                        cx,
+                    ))
+                    .child(Self::toggle_row(
+                        "scroll-smooth-h",
+                        tr!("Smooth horizontal"),
+                        self.settings.smooth_horizontal,
+                        |s, v| s.smooth_horizontal = v,
+                        pal,
+                        cx,
+                    ))
+                    .child(slider_row(
+                        tr!("Speed"),
+                        self.settings.horizontal_speed,
+                        &self.horizontal_speed,
+                        pal,
+                        false,
+                    ))
+                    .child(slider_row(
+                        tr!("Step"),
+                        self.settings.horizontal_step,
+                        &self.horizontal_step,
+                        pal,
+                        false,
+                    )),
+                pal,
+            ))
+            .child(section(
+                tr!("SMOOTH FEEL"),
+                v_flex()
+                    .gap_3()
+                    .child(Self::toggle_row(
+                        "scroll-smooth",
+                        tr!("Smooth scrolling"),
+                        self.settings.smooth,
+                        |s, v| s.smooth = v,
+                        pal,
+                        cx,
+                    ))
+                    .child(slider_row(
+                        tr!("Duration"),
+                        self.settings.duration,
+                        &self.duration,
+                        pal,
+                        false,
+                    ))
+                    .child(slider_row(
+                        tr!("Dead zone"),
+                        self.settings.dead_zone,
+                        &self.dead_zone,
+                        pal,
+                        false,
+                    )),
+                pal,
+            ))
+            .child(section(
+                tr!("SMARTSHIFT"),
+                v_flex()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(pal.text_primary)
+                                    .child(tr!("Ratchet mode")),
+                            )
+                            .child(
+                                Switch::new("smartshift-ratchet")
+                                    .checked(ratchet_mode)
+                                    .on_click(cx.listener(|_this, checked: &bool, _window, cx| {
+                                        Self::set_ratchet_mode(*checked, cx);
+                                    })),
+                            ),
+                    )
+                    .child(slider_row(
+                        tr!("SmartShift sensitivity"),
+                        f64::from(smartshift_percent),
+                        &self.smartshift_sensitivity,
+                        pal,
+                        smartshift_disabled,
+                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(pal.text_muted)
+                            .child(tr!("Sensitivity applies only while Ratchet mode is on.")),
+                    ),
+                pal,
+            ))
             .child(
                 div()
                     .id("scroll-reset")
@@ -477,10 +470,10 @@ fn smartshift_slider_state(value: f32) -> SliderState {
 }
 
 fn smartshift_percent_from_state(state: &AppState) -> u8 {
-    state
-        .active_smartshift_sensitivity()
-        .map(hardware::smartshift_raw_to_percent)
-        .unwrap_or_else(default_smartshift_percent)
+    state.active_smartshift_sensitivity().map_or_else(
+        default_smartshift_percent,
+        hardware::smartshift_raw_to_percent,
+    )
 }
 
 fn default_smartshift_percent() -> u8 {
@@ -488,30 +481,31 @@ fn default_smartshift_percent() -> u8 {
 }
 
 fn active_smartshift_snapshot(cx: &mut Context<ScrollPanel>) -> (bool, Option<DeviceRoute>) {
-    cx.try_global::<AppState>()
-        .map(|state| {
-            (
-                state.active_smartshift_ratchet_mode().unwrap_or(false),
-                state.current_record().and_then(|record| record.route.clone()),
-            )
-        })
-        .unwrap_or((false, None))
+    cx.try_global::<AppState>().map_or((false, None), |state| {
+        (
+            state.active_smartshift_ratchet_mode().unwrap_or(false),
+            state
+                .current_record()
+                .and_then(|record| record.route.clone()),
+        )
+    })
 }
 
 fn smartshift_render_snapshot(cx: &mut Context<ScrollPanel>) -> (bool, Option<DeviceRoute>, u8) {
     cx.try_global::<AppState>()
-        .map(|state| {
+        .map_or((false, None, default_smartshift_percent()), |state| {
             (
                 state.active_smartshift_ratchet_mode().unwrap_or(false),
-                state.current_record().and_then(|record| record.route.clone()),
+                state
+                    .current_record()
+                    .and_then(|record| record.route.clone()),
                 smartshift_percent_from_state(state),
             )
         })
-        .unwrap_or((false, None, default_smartshift_percent()))
 }
 
 fn smartshift_slider_needs_sync(current: f32, target: f32) -> bool {
-    current != target
+    (current - target).abs() > f32::EPSILON
 }
 
 #[allow(

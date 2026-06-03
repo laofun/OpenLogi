@@ -160,6 +160,10 @@ pub struct ScrollSettings {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "wire-format mirror of ScrollSettings for backward-compatible deserialization"
+)]
 struct ScrollSettingsWire {
     #[serde(default = "default_true")]
     smooth: bool,
@@ -644,12 +648,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
-            r#"schema_version = 1
-
-[app_settings.scroll]
-speed = 5.5
-step = 12.5
-"#,
+            "schema_version = 1\n\n[app_settings.scroll]\nspeed = 5.5\nstep = 12.5\n",
         )
         .expect("write");
 

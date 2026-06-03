@@ -152,7 +152,7 @@ pub fn set_smartshift_mode_in_background(
         let index = target.device_index();
         match result {
             Ok(Ok(status)) => {
-                debug!(index, ?mode, applied = ?status.mode, reused, "SmartShift mode set")
+                debug!(index, ?mode, applied = ?status.mode, reused, "SmartShift mode set");
             }
             Ok(Err(e)) => warn!(error = ?e, "SmartShift mode set failed"),
             Err(_) => warn!(
@@ -272,7 +272,6 @@ pub fn write_dpi_in_background(
         }
     });
 }
-
 
 #[cfg(test)]
 mod tests {
