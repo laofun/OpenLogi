@@ -297,14 +297,16 @@ extern "C" fn display_link_cb(
     let cfg = driver.scroll.load();
     let transition = scroll::duration_to_transition(cfg.duration);
     let dead_zone = cfg.dead_zone.max(MIN_DEAD_ZONE); // floor: guarantees convergence
-    if let Some((dx, dy, pid)) = driver.shared.frame(transition, dead_zone) {
-        post_synthetic_scroll(dx, dy, pid);
-    } else if !driver.shared.rearm_if_pending() {
-        // Genuinely idle — park the link until the next push restarts it. If a
-        // push raced in during parking, rearm_if_pending() returned true and we
-        // keep firing so the next callback drains the new delta.
-        // SAFETY: valid link ref; CVDisplayLinkStop is thread-safe.
+    let frame = driver.shared.frame_or_stop(transition, dead_zone, || {
+        // Genuinely settled — park the link. Running this under the SharedSmooth
+        // lock orders the Stop against a concurrent arming push's Start, so they
+        // cannot reorder into a stopped-but-running wedge.
+        // SAFETY: valid link ref; CVDisplayLinkStop is thread-safe and, called
+        // from within the link's own callback, returns without waiting.
         unsafe { CVDisplayLinkStop(driver.link) };
+    });
+    if let Some((dx, dy, pid)) = frame {
+        post_synthetic_scroll(dx, dy, pid);
     }
     0 // kCVReturnSuccess
 }
@@ -440,17 +442,26 @@ fn handle_scroll_event(
     }
     #[allow(clippy::cast_possible_truncation, reason = "PID fits in i32")]
     let pid = event.get_integer_value_field(EventField::EVENT_TARGET_UNIX_PROCESS_ID) as i32;
-    if driver.shared.push(
+    if pid <= 0 {
+        // No specific target process: CGEventPostToPid(0, ..) is a no-op, so we
+        // must not Drop the original — pass it through unsmoothed instead.
+        return CallbackResult::Keep;
+    }
+    driver.shared.push(
         if smooth_h { dx } else { 0.0 },
         if smooth_v { dy } else { 0.0 },
         cfg.speed,
         cfg.step,
         pid,
-    ) {
-        // This push armed a previously idle engine — start the frame clock.
-        // SAFETY: link created in build_scroll_driver; safe to start from any thread.
-        unsafe { CVDisplayLinkStart(driver.link) };
-    }
+        || {
+            // This push armed a previously idle engine — start the frame clock.
+            // Running under the SharedSmooth lock orders this Start against a
+            // concurrent settle's Stop so they cannot reorder.
+            // SAFETY: link created in build_scroll_driver; CVDisplayLinkStart is
+            // thread-safe and returns immediately without taking our mutex.
+            unsafe { CVDisplayLinkStart(driver.link) };
+        },
+    );
     CallbackResult::Drop // swallow original; frames re-emit it
 }
 

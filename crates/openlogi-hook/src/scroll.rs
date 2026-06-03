@@ -113,8 +113,8 @@ struct EngineState {
 }
 
 /// Shared smoothing state. The tap thread calls [`Self::push`]; the display-link
-/// thread calls [`Self::frame`] / [`Self::rearm_if_pending`]. All state lives
-/// under a single mutex so a push that races a park cannot lose its wakeup.
+/// thread calls [`Self::frame_or_stop`]. All state lives under a single mutex so
+/// a push that races a park cannot lose its wakeup.
 #[derive(Debug, Default)]
 pub struct SharedSmooth {
     state: Mutex<EngineState>,
@@ -126,51 +126,45 @@ impl SharedSmooth {
         Self::default()
     }
 
-    /// Add an input tick (already inverted) and remember its target PID.
-    /// Returns `true` when the caller must start the display link — i.e. this
-    /// push armed a previously idle engine. The run-flag flips under the same
-    /// lock as the buffer, so a concurrent [`Self::frame`] parking the link
-    /// cannot lose this wakeup.
-    pub fn push(&self, dx: f64, dy: f64, speed: f64, step: f64, pid: i32) -> bool {
+    /// Add an input tick (already inverted) and remember its target PID. If this
+    /// push arms a previously idle engine, `start` is invoked **while the lock is
+    /// still held**, so the display-link start is ordered against a concurrent
+    /// stop decision in [`Self::frame_or_stop`] and the two FFI calls can never
+    /// reorder into a "stopped but running" wedge.
+    pub fn push(&self, dx: f64, dy: f64, speed: f64, step: f64, pid: i32, start: impl FnOnce()) {
         let Ok(mut st) = self.state.lock() else {
-            return false;
+            return;
         };
         st.target_pid = pid;
         st.engine.add(dx, dy, speed, step);
-        if st.running {
-            false
-        } else {
+        if !st.running {
             st.running = true;
-            true
+            start();
         }
     }
 
-    /// Advance one frame. `Some((dx, dy, pid))` to post, or `None` when the run
-    /// has settled. On `None`, clears the run-flag under the lock; the caller
-    /// must then call [`Self::rearm_if_pending`] before stopping the link.
-    pub fn frame(&self, transition: f64, dead_zone: f64) -> Option<(f64, f64, i32)> {
+    /// Advance one frame. Returns `Some((dx, dy, pid))` to post this frame.
+    /// When the run has settled, this clears the run-flag and invokes `stop`
+    /// **while the lock is held**, then returns `None`. Holding the lock across
+    /// the stop means a concurrent arming [`Self::push`] cannot start the link
+    /// after this stop has been decided: the push either runs first (its work is
+    /// seen by `advance`, so we don't settle) or runs strictly after the stop
+    /// completes (and then restarts the link cleanly). This replaces the old
+    /// `frame` + `rearm_if_pending` two-step, whose separate unlocked FFI could
+    /// reorder into a permanently-stopped-but-running wedge.
+    pub fn frame_or_stop(
+        &self,
+        transition: f64,
+        dead_zone: f64,
+        stop: impl FnOnce(),
+    ) -> Option<(f64, f64, i32)> {
         let mut st = self.state.lock().ok()?;
         if let Some((dx, dy)) = st.engine.advance(transition, dead_zone) {
             Some((dx, dy, st.target_pid))
         } else {
             st.running = false;
+            stop();
             None
-        }
-    }
-
-    /// After [`Self::frame`] returned `None`, re-check whether a concurrent
-    /// [`Self::push`] re-armed the engine during parking. Returns `true` (and
-    /// re-sets the run-flag) when there is fresh work, so the caller keeps the
-    /// link running instead of stopping it; `false` when genuinely idle.
-    pub fn rearm_if_pending(&self) -> bool {
-        let Ok(mut st) = self.state.lock() else {
-            return false;
-        };
-        if st.engine.is_idle() {
-            false
-        } else {
-            st.running = true;
-            true
         }
     }
 }
@@ -182,6 +176,7 @@ impl SharedSmooth {
 )]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn duration_transition_matches_mos_formula() {
@@ -239,9 +234,11 @@ mod tests {
     #[test]
     fn shared_smooth_drains_to_none() {
         let s = SharedSmooth::new();
-        assert!(s.push(0.0, 10.0, 1.0, 0.0, 1234)); // idle → caller starts link
+        let started = Cell::new(false);
+        s.push(0.0, 10.0, 1.0, 0.0, 1234, || started.set(true));
+        assert!(started.get(), "idle push must start the link");
         let mut got = 0.0;
-        while let Some((_, dy, pid)) = s.frame(0.5, 0.5) {
+        while let Some((_, dy, pid)) = s.frame_or_stop(0.5, 0.5, || {}) {
             assert_eq!(pid, 1234);
             got += dy;
         }
@@ -249,19 +246,30 @@ mod tests {
     }
 
     #[test]
-    fn push_signals_start_only_when_idle() {
+    fn push_starts_only_when_idle() {
         let s = SharedSmooth::new();
-        assert!(s.push(0.0, 10.0, 1.0, 0.0, 1)); // was idle → start
-        assert!(!s.push(0.0, 10.0, 1.0, 0.0, 1)); // already running → no start
+        let starts = Cell::new(0u32);
+        s.push(0.0, 10.0, 1.0, 0.0, 1, || starts.set(starts.get() + 1)); // idle → start
+        s.push(0.0, 10.0, 1.0, 0.0, 1, || starts.set(starts.get() + 1)); // running → no start
+        assert_eq!(starts.get(), 1);
     }
 
     #[test]
-    fn rearm_detects_a_raced_push() {
+    fn frame_or_stop_invokes_stop_when_settled() {
         let s = SharedSmooth::new();
-        assert!(s.push(0.0, 10.0, 1.0, 0.0, 1));
-        while s.frame(0.5, 0.5).is_some() {} // drain → frame cleared running
-        assert!(!s.rearm_if_pending()); // genuinely idle
-        assert!(s.push(0.0, 10.0, 1.0, 0.0, 1)); // fresh work arrives
-        assert!(s.rearm_if_pending()); // re-armed
+        s.push(0.0, 10.0, 1.0, 0.0, 1, || {});
+        let stopped = Cell::new(false);
+        while s.frame_or_stop(0.5, 0.5, || stopped.set(true)).is_some() {}
+        assert!(stopped.get(), "settling must stop the link");
+    }
+
+    #[test]
+    fn push_after_settle_restarts() {
+        let s = SharedSmooth::new();
+        s.push(0.0, 10.0, 1.0, 0.0, 1, || {});
+        while s.frame_or_stop(0.5, 0.5, || {}).is_some() {}
+        let restarted = Cell::new(false);
+        s.push(0.0, 10.0, 1.0, 0.0, 1, || restarted.set(true)); // idle again → restart
+        assert!(restarted.get(), "a push after settle must restart the link");
     }
 }

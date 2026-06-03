@@ -222,8 +222,9 @@ mod macos;
 
 #[allow(
     dead_code,
-    reason = "consumed by the macOS smooth-scroll FFI added in a later task; \
-              for now only the in-module unit tests reference it"
+    reason = "fully consumed by the macOS smooth-scroll engine in macos.rs; on \
+              non-macOS targets only MIN_DEAD_ZONE (re-exported) is reachable, so \
+              the rest of the module is unused there"
 )]
 mod scroll;
 
