@@ -115,6 +115,48 @@ pub(crate) fn frontmost_bundle_id() -> Option<String> {
     }
 }
 
+/// Negate axis 1 (vertical) and/or axis 2 (horizontal) deltas in place.
+///
+/// Mutates the wheel event's three delta representations (line, point, and
+/// fixed-point) per axis so apps reading any representation observe the
+/// inversion — matching Mos' `reverseY`/`reverseX`. The `CGEvent` setters
+/// take `&self` (interior mutability via the underlying CFType), so an
+/// in-place edit inside the tap callback is valid even though `event` is a
+/// shared reference.
+fn apply_invert(event: &CGEvent, reverse_vertical: bool, reverse_horizontal: bool) {
+    if reverse_vertical {
+        negate_axis(
+            event,
+            EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
+            EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
+            EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_1,
+        );
+    }
+    if reverse_horizontal {
+        negate_axis(
+            event,
+            EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
+            EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
+            EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_2,
+        );
+    }
+}
+
+/// Negate all three delta representations of a single scroll axis in place.
+fn negate_axis(
+    event: &CGEvent,
+    line_field: core_graphics::event::CGEventField,
+    point_field: core_graphics::event::CGEventField,
+    fixed_field: core_graphics::event::CGEventField,
+) {
+    let line = event.get_integer_value_field(line_field);
+    event.set_integer_value_field(line_field, -line);
+    let point = event.get_double_value_field(point_field);
+    event.set_double_value_field(point_field, -point);
+    let fixed = event.get_double_value_field(fixed_field);
+    event.set_double_value_field(fixed_field, -fixed);
+}
+
 /// Translate a raw OS button number to a [`ButtonId`].
 ///
 /// Logi's convention: button 0 = left, 1 = right, 2 = middle, 3 = back,
@@ -225,8 +267,6 @@ fn thread_main(
     scroll: Arc<ArcSwap<ScrollSettings>>,
     rl_tx: mpsc::Sender<CFRunLoop>,
 ) {
-    // Used by the scroll engine in a later task; bound now to thread the cell through.
-    let _ = &scroll;
     let event_types = vec![
         CGEventType::LeftMouseDown,
         CGEventType::LeftMouseUp,
@@ -237,12 +277,21 @@ fn thread_main(
         CGEventType::ScrollWheel,
     ];
 
+    let scroll_for_tap = scroll.clone();
     let tap_result = CGEventTap::new(
         CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
         event_types,
         move |_proxy: CGEventTapProxy, etype: CGEventType, event: &CGEvent| {
+            if matches!(etype, CGEventType::ScrollWheel) {
+                let cfg = scroll_for_tap.load();
+                apply_invert(event, cfg.reverse_vertical, cfg.reverse_horizontal);
+                // Smoothing is added in later tasks; for now, always keep the
+                // (possibly inverted) event. The scroll engine — not the
+                // generic `cb` — is the authority over wheel events.
+                return CallbackResult::Keep;
+            }
             let Some(mouse_event) = translate(etype, event) else {
                 return CallbackResult::Keep;
             };
