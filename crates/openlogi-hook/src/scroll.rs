@@ -92,6 +92,49 @@ impl SmoothEngine {
     }
 }
 
+use std::sync::Mutex;
+
+/// Minimum dead-zone used when consuming frames. Flooring `dead_zone` here
+/// guarantees `SmoothEngine::advance` always converges to its cutoff: with a
+/// non-positive dead_zone the geometric lerp tail never falls below it and the
+/// display link would emit tiny frames forever. The GUI also clamps its slider
+/// to this minimum.
+pub const MIN_DEAD_ZONE: f64 = 0.1;
+
+/// Shared smoothing state plus the captured target PID. The tap thread writes
+/// (`push`); the display-link thread drains (`frame`).
+#[derive(Debug, Default)]
+pub struct SharedSmooth {
+    engine: Mutex<SmoothEngine>,
+    /// PID of the app the original scroll targeted, captured on the last input.
+    target_pid: std::sync::atomic::AtomicI32,
+}
+
+impl SharedSmooth {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add an input tick and remember its target PID.
+    pub fn push(&self, dx: f64, dy: f64, speed: f64, step: f64, pid: i32) {
+        self.target_pid
+            .store(pid, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut e) = self.engine.lock() {
+            e.add(dx, dy, speed, step);
+        }
+    }
+
+    /// Compute the next frame. Returns `(dx, dy, pid)` to post, or `None` when
+    /// settled (caller should stop the display link).
+    pub fn frame(&self, transition: f64, dead_zone: f64) -> Option<(f64, f64, i32)> {
+        let mut e = self.engine.lock().ok()?;
+        let (dx, dy) = e.advance(transition, dead_zone)?;
+        let pid = self.target_pid.load(std::sync::atomic::Ordering::Relaxed);
+        Some((dx, dy, pid))
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::float_cmp,
@@ -151,5 +194,17 @@ mod tests {
         let mut e = SmoothEngine::new();
         assert!(e.advance(0.1, 1.0).is_none());
         assert!(e.is_idle());
+    }
+
+    #[test]
+    fn shared_smooth_drains_to_none() {
+        let s = SharedSmooth::new();
+        s.push(0.0, 10.0, 1.0, 0.0, 1234);
+        let mut got = 0.0;
+        while let Some((_, dy, pid)) = s.frame(0.5, 0.5) {
+            assert_eq!(pid, 1234);
+            got += dy;
+        }
+        assert!(got > 8.0);
     }
 }

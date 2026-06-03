@@ -1,5 +1,6 @@
 //! macOS `CGEventTap` implementation of the OS-level mouse hook.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
@@ -11,11 +12,46 @@ use core_foundation::runloop::{
 };
 use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
-    CGEventTapProxy, CGEventType, CallbackResult, EventField,
+    CGEventTapProxy, CGEventType, CallbackResult, EventField, ScrollEventUnit,
 };
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use tracing::{debug, error, warn};
 
+use crate::scroll::{self, MIN_DEAD_ZONE, SharedSmooth};
 use crate::{ButtonId, EventDisposition, HookError, MouseEvent};
+
+type CVReturn = i32;
+type CVDisplayLinkRef = *mut std::ffi::c_void;
+type CVTimeStamp = std::ffi::c_void;
+
+type CVDisplayLinkOutputCallback = extern "C" fn(
+    CVDisplayLinkRef,
+    *const CVTimeStamp,
+    *const CVTimeStamp,
+    u64,
+    *mut u64,
+    *mut std::ffi::c_void,
+) -> CVReturn;
+
+#[link(name = "CoreVideo", kind = "framework")]
+unsafe extern "C" {
+    fn CVDisplayLinkCreateWithActiveCGDisplays(out: *mut CVDisplayLinkRef) -> CVReturn;
+    fn CVDisplayLinkSetOutputCallback(
+        link: CVDisplayLinkRef,
+        cb: CVDisplayLinkOutputCallback,
+        user_info: *mut std::ffi::c_void,
+    ) -> CVReturn;
+    fn CVDisplayLinkStart(link: CVDisplayLinkRef) -> CVReturn;
+    fn CVDisplayLinkStop(link: CVDisplayLinkRef) -> CVReturn;
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGEventPostToPid(pid: i32, event: core_foundation::base::CFTypeRef);
+}
+
+/// Marker stamped on our synthetic events (`eventSourceUserData`) so the tap skips them.
+const SYNTHETIC_MARKER: i64 = 0x4F4C_4753; // "OLGS"
 
 /// Everything `Hook` needs to control the background thread.
 pub(crate) struct HookInner {
@@ -224,6 +260,71 @@ fn translate(etype: CGEventType, event: &CGEvent) -> Option<MouseEvent> {
     }
 }
 
+/// Owns the running display link and the shared smoothing state.
+struct ScrollDriver {
+    shared: Arc<SharedSmooth>,
+    scroll: Arc<ArcSwap<ScrollSettings>>,
+    link: CVDisplayLinkRef,
+    running: AtomicBool,
+}
+
+// SAFETY: CVDisplayLinkRef is a CoreVideo object pointer; CoreVideo permits
+// start/stop from any thread. The Arc fields are Send+Sync.
+unsafe impl Send for ScrollDriver {}
+// SAFETY: see the Send impl; all mutable cross-thread state lives in the
+// AtomicBool / Arc fields, so shared access from multiple threads is sound.
+unsafe impl Sync for ScrollDriver {}
+
+extern "C" fn display_link_cb(
+    _link: CVDisplayLinkRef,
+    _now: *const CVTimeStamp,
+    _out: *const CVTimeStamp,
+    _flags: u64,
+    _flags_out: *mut u64,
+    user_info: *mut std::ffi::c_void,
+) -> CVReturn {
+    // SAFETY: `user_info` is the `*const ScrollDriver` we passed to
+    // CVDisplayLinkSetOutputCallback; the driver is leaked ('static), so it
+    // outlives the link.
+    let driver = unsafe { &*(user_info as *const ScrollDriver) };
+    let cfg = driver.scroll.load();
+    let transition = scroll::duration_to_transition(cfg.duration);
+    let dead_zone = cfg.dead_zone.max(MIN_DEAD_ZONE); // floor: guarantees convergence
+    if let Some((dx, dy, pid)) = driver.shared.frame(transition, dead_zone) {
+        post_synthetic_scroll(dx, dy, pid);
+    } else {
+        driver.running.store(false, Ordering::Release);
+        // SAFETY: valid link ref; CVDisplayLinkStop is thread-safe.
+        unsafe { CVDisplayLinkStop(driver.link) };
+    }
+    0 // kCVReturnSuccess
+}
+
+/// Build one continuous (pixel) synthetic scroll event, tag it, post to `pid`.
+fn post_synthetic_scroll(dx: f64, dy: f64, pid: i32) {
+    use foreign_types::ForeignType as _;
+
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+        return;
+    };
+    // wheel1 = vertical, wheel2 = horizontal (rounded to whole pixels).
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "per-frame pixel deltas are small interpolation steps that fit in i32"
+    )]
+    let (wheel1, wheel2) = (dy.round() as i32, dx.round() as i32);
+    let Ok(event) = CGEvent::new_scroll_event(source, ScrollEventUnit::PIXEL, 2, wheel1, wheel2, 0)
+    else {
+        return;
+    };
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER);
+    event.set_double_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1.0);
+    // SAFETY: `event` is a live CGEventRef for the call; CGEventPostToPid copies
+    // what it needs. `as_ptr()` yields the raw event pointer (CGEvent uses
+    // foreign_types, not TCFType); we cast it to the `CFTypeRef` the C ABI wants.
+    unsafe { CGEventPostToPid(pid, event.as_ptr().cast()) };
+}
+
 /// Create the event tap and run loop on a dedicated thread.
 pub(crate) fn start(
     cb: impl Fn(MouseEvent) -> EventDisposition + Send + Sync + 'static,
@@ -257,6 +358,87 @@ pub(crate) fn start(
     Ok(HookInner { thread, run_loop })
 }
 
+/// Allocate the display-link + smoothing state and wire the output callback,
+/// returning a shared `&'static` reference to the leaked driver.
+///
+/// The driver is reached both from the leaked reference captured in the tap
+/// closure and from the raw `*const` handed to the C callback, so access is
+/// shared (`&'static`, not `&mut`) — all mutable cross-thread state lives in
+/// the `AtomicBool` / `Arc` fields.
+fn build_scroll_driver(scroll: Arc<ArcSwap<ScrollSettings>>) -> &'static ScrollDriver {
+    let mut link: CVDisplayLinkRef = std::ptr::null_mut();
+    // SAFETY: out-pointer receives a fresh link; we configure the callback +
+    // user_info before any Start, and the driver is leaked below so the pointer
+    // stays valid for the process lifetime.
+    unsafe {
+        CVDisplayLinkCreateWithActiveCGDisplays(&raw mut link);
+    }
+    // Leak for the thread's lifetime; the process owns it until exit.
+    let driver: &'static ScrollDriver = Box::leak(Box::new(ScrollDriver {
+        shared: Arc::new(SharedSmooth::new()),
+        scroll,
+        link,
+        running: AtomicBool::new(false),
+    }));
+    // SAFETY: callback receives the leaked driver pointer; user_info outlives
+    // the link because the driver is never freed.
+    unsafe {
+        CVDisplayLinkSetOutputCallback(
+            driver.link,
+            display_link_cb,
+            std::ptr::from_ref(driver) as *mut std::ffi::c_void,
+        );
+    }
+    driver
+}
+
+/// Handle a `ScrollWheel` event inside the tap callback: drop our own synthetic
+/// frames, apply inversion, and — when smoothing is enabled for an active axis —
+/// feed the engine, kick the display link, and swallow the original event so the
+/// interpolated frames replace it. Returns `Keep` for the inverted-only path.
+fn handle_scroll_event(
+    driver: &ScrollDriver,
+    scroll: &ArcSwap<ScrollSettings>,
+    event: &CGEvent,
+) -> CallbackResult {
+    // Skip our own synthetic frames.
+    if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == SYNTHETIC_MARKER {
+        return CallbackResult::Keep;
+    }
+    let cfg = scroll.load();
+    apply_invert(event, cfg.reverse_vertical, cfg.reverse_horizontal);
+
+    let dy = event.get_double_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
+    let dx = event.get_double_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact-zero check: skip axes with no delta"
+    )]
+    let smooth_v = cfg.smooth && cfg.smooth_vertical && dy != 0.0;
+    #[allow(
+        clippy::float_cmp,
+        reason = "exact-zero check: skip axes with no delta"
+    )]
+    let smooth_h = cfg.smooth && cfg.smooth_horizontal && dx != 0.0;
+    if !(smooth_v || smooth_h) {
+        return CallbackResult::Keep; // inverted-only or smoothing off
+    }
+    #[allow(clippy::cast_possible_truncation, reason = "PID fits in i32")]
+    let pid = event.get_integer_value_field(EventField::EVENT_TARGET_UNIX_PROCESS_ID) as i32;
+    driver.shared.push(
+        if smooth_h { dx } else { 0.0 },
+        if smooth_v { dy } else { 0.0 },
+        cfg.speed,
+        cfg.step,
+        pid,
+    );
+    if !driver.running.swap(true, Ordering::AcqRel) {
+        // SAFETY: link created in build_scroll_driver; safe to start from any thread.
+        unsafe { CVDisplayLinkStart(driver.link) };
+    }
+    CallbackResult::Drop // swallow original; frames re-emit it
+}
+
 /// Body of the background hook thread.
 #[allow(
     clippy::needless_pass_by_value,
@@ -277,6 +459,8 @@ fn thread_main(
         CGEventType::ScrollWheel,
     ];
 
+    let driver = build_scroll_driver(scroll.clone());
+
     let scroll_for_tap = scroll.clone();
     let tap_result = CGEventTap::new(
         CGEventTapLocation::HID,
@@ -285,12 +469,7 @@ fn thread_main(
         event_types,
         move |_proxy: CGEventTapProxy, etype: CGEventType, event: &CGEvent| {
             if matches!(etype, CGEventType::ScrollWheel) {
-                let cfg = scroll_for_tap.load();
-                apply_invert(event, cfg.reverse_vertical, cfg.reverse_horizontal);
-                // Smoothing is added in later tasks; for now, always keep the
-                // (possibly inverted) event. The scroll engine — not the
-                // generic `cb` — is the authority over wheel events.
-                return CallbackResult::Keep;
+                return handle_scroll_event(driver, &scroll_for_tap, event);
             }
             let Some(mouse_event) = translate(etype, event) else {
                 return CallbackResult::Keep;
@@ -354,6 +533,11 @@ fn thread_main(
             break;
         }
     }
+
+    // Stop the display link so synthetic frames cease the moment the tap tears
+    // down (e.g. Accessibility revoked / shutdown).
+    // SAFETY: `driver.link` is a valid display link for the process lifetime.
+    unsafe { CVDisplayLinkStop(driver.link) };
 
     // Detach the tap from the event stream synchronously before unwinding,
     // so input recovers immediately rather than whenever CF happens to

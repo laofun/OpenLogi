@@ -17,6 +17,7 @@ arc-swap = "1"
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { workspace = true }
 core-foundation = { workspace = true }
+foreign-types = { workspace = true }
 cocoa = "0.26"
 objc = "0.2"
 

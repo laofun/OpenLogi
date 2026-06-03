@@ -58,6 +58,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 core-graphics = { version = "0.25", default-features = false, features = ["link"] }
 core-foundation = { version = "0.10", default-features = false, features = ["link"] }
+# Re-exported by core-graphics for its `foreign_type!` types; needed directly to
+# bring `ForeignType::as_ptr` into scope when handing a `CGEvent` to raw FFI.
+foreign-types = "0.5"
 
 # gpui / gpui_platform track zed's default branch, matching how gpui-component
 # declares them (an explicit rev here would fork the git source and conflict).
