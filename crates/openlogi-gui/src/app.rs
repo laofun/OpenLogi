@@ -21,6 +21,7 @@ pub struct AppView {
     carousel: Entity<DeviceCarousel>,
     mouse_model: Entity<MouseModelView>,
     dpi_panel: Entity<DpiPanel>,
+    scroll_panel: Entity<crate::components::scroll_panel::ScrollPanel>,
     #[allow(dead_code, reason = "held to keep the appearance observer alive")]
     appearance_obs: Option<Subscription>,
     /// Re-renders the root when the device list changes so the empty state
@@ -65,11 +66,13 @@ impl AppView {
         let carousel = cx.new(DeviceCarousel::new);
         let mouse_model = cx.new(MouseModelView::new);
         let dpi_panel = cx.new(DpiPanel::new);
+        let scroll_panel = cx.new(crate::components::scroll_panel::ScrollPanel::new);
         let state_obs = cx.observe_global::<AppState>(|_, cx| cx.notify());
         Self {
             carousel,
             mouse_model,
             dpi_panel,
+            scroll_panel,
             appearance_obs: None,
             state_obs,
             accessibility_dismissed: false,
@@ -175,7 +178,7 @@ impl Render for AppView {
             .is_some_and(|s| !s.device_list.is_empty());
         let scanning = cx.try_global::<AppState>().is_some_and(|s| s.scanning);
         let body = if has_device {
-            body(&self.mouse_model, &self.dpi_panel).into_any_element()
+            body(&self.mouse_model, &self.dpi_panel, &self.scroll_panel).into_any_element()
         } else {
             device_empty_state(pal, scanning)
         };
@@ -211,7 +214,11 @@ fn header(carousel: &Entity<DeviceCarousel>, pal: Palette) -> impl IntoElement {
         .child(div().flex_1().min_w_0().child(carousel.clone()))
 }
 
-fn body(mouse_model: &Entity<MouseModelView>, dpi_panel: &Entity<DpiPanel>) -> impl IntoElement {
+fn body(
+    mouse_model: &Entity<MouseModelView>,
+    dpi_panel: &Entity<DpiPanel>,
+    scroll_panel: &Entity<crate::components::scroll_panel::ScrollPanel>,
+) -> impl IntoElement {
     h_flex()
         .flex_1()
         .w_full()
@@ -222,6 +229,7 @@ fn body(mouse_model: &Entity<MouseModelView>, dpi_panel: &Entity<DpiPanel>) -> i
         .p_6()
         .child(mouse_model.clone())
         .child(dpi_panel.clone())
+        .child(scroll_panel.clone())
 }
 
 /// Body shown when no device is connected. The inventory watcher keeps polling

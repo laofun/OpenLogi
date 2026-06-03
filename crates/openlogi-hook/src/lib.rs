@@ -26,6 +26,8 @@
 
 pub use openlogi_core::binding::ButtonId;
 
+pub use scroll::MIN_DEAD_ZONE;
+
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;

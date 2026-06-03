@@ -6,7 +6,7 @@
 //! installation, and action dispatch for both hook and gesture events.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use openlogi_core::binding::{Action, ButtonId};
 use openlogi_hid::CaptureChannel;
@@ -18,6 +18,38 @@ use crate::state::DpiCycleState;
 
 /// Shared binding map threaded between `AppState` and the hook callback.
 pub type BindingMap = Arc<RwLock<BTreeMap<ButtonId, Action>>>;
+
+/// The running hook, owned globally so the GUI scroll panel can push settings
+/// to it live. Replaces the former task-local `hook_handle` ownership in
+/// `main.rs`. `None` whenever Accessibility is not granted.
+static LIVE_HOOK: OnceLock<Mutex<Option<Hook>>> = OnceLock::new();
+
+fn live_cell() -> &'static Mutex<Option<Hook>> {
+    LIVE_HOOK.get_or_init(|| Mutex::new(None))
+}
+
+/// Store (or clear) the running hook. Dropping the previous `Some` here tears
+/// down its `CGEventTap`, matching the old `hook_handle = None` behavior.
+pub fn set_live_hook(hook: Option<Hook>) {
+    if let Ok(mut g) = live_cell().lock() {
+        *g = hook;
+    }
+}
+
+/// Whether a hook is currently installed. Mirrors the old `hook_handle.is_some()`.
+pub fn live_hook_active() -> bool {
+    live_cell().lock().is_ok_and(|g| g.is_some())
+}
+
+/// Push scroll settings to the running hook, if any. Cheap and lock-free past
+/// the mutex; safe to call from the GPUI thread on every edit.
+pub fn push_scroll_settings(settings: openlogi_core::config::ScrollSettings) {
+    if let Ok(g) = live_cell().lock() {
+        if let Some(h) = g.as_ref() {
+            h.set_scroll_settings(settings);
+        }
+    }
+}
 
 /// Attempt to start the OS hook. Returns `None` if Accessibility is not
 /// granted or on an unsupported platform — the app continues without crashing.

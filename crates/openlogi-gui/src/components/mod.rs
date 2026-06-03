@@ -6,3 +6,4 @@
 
 pub mod device_carousel;
 pub mod dpi_panel;
+pub mod scroll_panel;

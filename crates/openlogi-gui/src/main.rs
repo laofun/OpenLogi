@@ -230,7 +230,6 @@ fn main() -> Result<()> {
                 }
             });
 
-            let mut hook_handle = None;
             // Asset depots are fetched once, in the background, when devices
             // first appear — startup no longer blocks on it.
             let mut assets_synced = false;
@@ -274,7 +273,7 @@ fn main() -> Result<()> {
                     }
                     Some(granted) = accessibility_rx.recv() => {
                         if !granted {
-                            hook_handle = None;
+                            hook_runtime::set_live_hook(None);
                         }
                         cx.update(|cx| {
                             if cx.has_global::<AppState>() {
@@ -284,12 +283,20 @@ fn main() -> Result<()> {
                             }
                             cx.refresh_windows();
                         });
-                        if granted && hook_handle.is_none() {
+                        if granted && !hook_runtime::live_hook_active() {
                             info!("accessibility granted — installing OS mouse hook");
-                            hook_handle = hook_runtime::start(
+                            let hook = hook_runtime::start(
                                 Arc::clone(&hook_arcs.0),
                                 Arc::clone(&hook_arcs.1),
                                 Arc::clone(&hook_arcs.2),
+                            );
+                            hook_runtime::set_live_hook(hook);
+                            // Push persisted scroll settings so inversion/smoothing
+                            // are active before the panel is ever opened.
+                            hook_runtime::push_scroll_settings(
+                                openlogi_core::config::Config::load_or_default()
+                                    .map(|c| c.scroll_settings())
+                                    .unwrap_or_default(),
                             );
                         }
                     }
