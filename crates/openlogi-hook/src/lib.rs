@@ -26,6 +26,11 @@
 
 pub use openlogi_core::binding::ButtonId;
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use openlogi_core::config::ScrollSettings;
+
 /// An event captured at the OS layer.
 #[derive(Clone, Debug)]
 pub enum MouseEvent {
@@ -81,6 +86,9 @@ pub enum HookError {
 pub struct Hook {
     #[cfg(target_os = "macos")]
     inner: Option<macos::HookInner>,
+    /// Current scroll settings, read live by the macOS tap. Shared via
+    /// `ArcSwap` so the tap callback reads it lock-free on the hot path.
+    scroll: Arc<ArcSwap<ScrollSettings>>,
     /// Makes `Hook` uninhabited on non-macOS targets, so [`Hook::start`] can
     /// only ever return `Err` there and the type can never be constructed.
     #[cfg(not(target_os = "macos"))]
@@ -113,13 +121,17 @@ impl Hook {
     pub fn start(
         cb: impl Fn(MouseEvent) -> EventDisposition + Send + Sync + 'static,
     ) -> Result<Self, HookError> {
+        let scroll = Arc::new(ArcSwap::from_pointee(ScrollSettings::default()));
         #[cfg(target_os = "macos")]
         {
-            macos::start(cb).map(|inner| Self { inner: Some(inner) })
+            macos::start(cb, scroll.clone()).map(|inner| Self {
+                inner: Some(inner),
+                scroll,
+            })
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = cb;
+            let _ = (cb, scroll);
             Err(HookError::Unsupported)
         }
     }
@@ -176,6 +188,12 @@ impl Hook {
         {
             macos::prompt_accessibility();
         }
+    }
+
+    /// Replace the live scroll settings read by the macOS scroll engine.
+    /// Cheap and lock-free; safe to call from the GPUI thread on every edit.
+    pub fn set_scroll_settings(&self, settings: ScrollSettings) {
+        self.scroll.store(Arc::new(settings));
     }
 }
 

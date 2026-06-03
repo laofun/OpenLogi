@@ -3,6 +3,9 @@
 use std::sync::{Arc, mpsc};
 use std::thread;
 
+use arc_swap::ArcSwap;
+use openlogi_core::config::ScrollSettings;
+
 use core_foundation::runloop::{
     CFRunLoop, CFRunLoopRunResult, kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
 };
@@ -182,6 +185,7 @@ fn translate(etype: CGEventType, event: &CGEvent) -> Option<MouseEvent> {
 /// Create the event tap and run loop on a dedicated thread.
 pub(crate) fn start(
     cb: impl Fn(MouseEvent) -> EventDisposition + Send + Sync + 'static,
+    scroll: Arc<ArcSwap<ScrollSettings>>,
 ) -> Result<HookInner, HookError> {
     if !has_accessibility() {
         return Err(HookError::AccessibilityDenied);
@@ -195,7 +199,7 @@ pub(crate) fn start(
 
     let thread = thread::Builder::new()
         .name("openlogi-hook".into())
-        .spawn(move || thread_main(cb, rl_tx))
+        .spawn(move || thread_main(cb, scroll, rl_tx))
         .map_err(|e| HookError::MacOsTap(e.to_string()))?;
 
     // Block until the background thread confirms the run loop is live, or
@@ -218,8 +222,11 @@ pub(crate) fn start(
 )]
 fn thread_main(
     cb: Arc<dyn Fn(MouseEvent) -> EventDisposition + Send + Sync>,
+    scroll: Arc<ArcSwap<ScrollSettings>>,
     rl_tx: mpsc::Sender<CFRunLoop>,
 ) {
+    // Used by the scroll engine in a later task; bound now to thread the cell through.
+    let _ = &scroll;
     let event_types = vec![
         CGEventType::LeftMouseDown,
         CGEventType::LeftMouseUp,

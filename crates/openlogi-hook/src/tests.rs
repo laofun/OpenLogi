@@ -43,6 +43,16 @@ fn event_disposition_equality() {
     assert_ne!(EventDisposition::PassThrough, EventDisposition::Suppress);
 }
 
+/// `set_scroll_settings` must be callable on a `Hook` value. We can't start a
+/// real tap without Accessibility, so this only guards the API shape via a
+/// compile-time reference to the method.
+#[test]
+fn hook_exposes_scroll_setter() {
+    fn _assert_api(h: &crate::Hook, s: openlogi_core::config::ScrollSettings) {
+        h.set_scroll_settings(s);
+    }
+}
+
 /// On non-macOS targets, `Hook::start` returns `Unsupported`.
 #[cfg(not(target_os = "macos"))]
 #[test]
