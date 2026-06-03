@@ -46,9 +46,11 @@ pub const DEFAULT_DPI: u32 = 1600;
 /// disappear mid-interaction.
 const INVENTORY_MISS_GRACE: u8 = 2;
 
-/// How many times to retry DPI capability discovery after a transient HID++
-/// error (read timeout, busy device) before marking the device unsupported. A
-/// genuine "feature not supported" reply is permanent and never retried.
+/// How many times to retry DPI capability discovery after a HID++ error
+/// (read timeout, busy device, or a BLE feature-table lookup that missed and
+/// returned a false "feature not supported") before settling on the retryable
+/// [`DpiStatus::Failed`]. No error is treated as permanent — a single transient
+/// miss must never permanently mark a capable device as DPI-less.
 const DPI_LOAD_MAX_ATTEMPTS: u8 = 3;
 
 /// Per-device DPI capability loading state.
@@ -65,8 +67,11 @@ pub enum DpiStatus {
     /// well support DPI — re-selecting it (see [`AppState::set_current_device`])
     /// grants a fresh attempt.
     Failed(String),
-    /// The device genuinely does not support the AdjustableDpi feature; never
-    /// retried.
+    /// Synthetic "no active device" placeholder used by the panel when no
+    /// device is selected. `store_dpi_info` never settles a real device here —
+    /// a discovery failure becomes [`Self::Failed`] (retryable) instead, so a
+    /// transient false `FeatureUnsupported` can't permanently wedge a capable
+    /// device.
     Unsupported(String),
 }
 
@@ -107,9 +112,9 @@ pub struct AppState {
     /// probe misses without hiding a real disconnect forever.
     inventory_misses: BTreeMap<String, u8>,
     /// Consecutive failed DPI discovery attempts, keyed by
-    /// [`DeviceRecord::config_key`]. Lets a transient read error retry a few
-    /// times (see [`DPI_LOAD_MAX_ATTEMPTS`]) instead of sticking the device on
-    /// [`DpiStatus::Unsupported`] forever.
+    /// [`DeviceRecord::config_key`]. Lets a read error retry a few times (see
+    /// [`DPI_LOAD_MAX_ATTEMPTS`]) before settling on the retryable
+    /// [`DpiStatus::Failed`], instead of wedging the device forever.
     dpi_load_attempts: BTreeMap<String, u8>,
     /// All paired devices, in carousel order. Each entry caches the per-
     /// device data the views need so a switch is a pure index update.
@@ -612,16 +617,14 @@ impl AppState {
                 self.dpi_load_attempts.remove(&key);
                 DpiStatus::Ready(info)
             }
-            // A genuine "feature not supported" reply will never change — record
-            // it and stop probing.
-            Err(error) if dpi_error_is_permanent(&error) => {
-                self.dpi_load_attempts.remove(&key);
-                DpiStatus::Unsupported(error.to_string())
-            }
-            // Timeouts and other transient failures get a few more tries: clear
-            // the status back to `Unknown` so the next render re-triggers the
-            // read, until the attempt budget runs out, then settle on `Failed`
-            // (retryable on re-select) rather than the permanent `Unsupported`.
+            // Every discovery failure — including a "feature not supported"
+            // reply — gets a few more tries: a BLE feature-table lookup can
+            // miss under load and return a false `FeatureUnsupported`, so no
+            // single error is treated as permanent. Clear the status back to
+            // `Unknown` so the next render re-triggers the read; once the
+            // attempt budget runs out, settle on `Failed` (retryable via
+            // click / re-select) rather than the terminal `Unsupported`, which
+            // would wedge a genuinely-capable device forever.
             Err(error) => {
                 let attempts = self.dpi_load_attempts.entry(key.clone()).or_insert(0);
                 *attempts = attempts.saturating_add(1);
@@ -922,16 +925,6 @@ impl AppState {
             }
         }
     }
-}
-
-/// Whether a DPI discovery error is permanent (the device genuinely lacks the
-/// feature or reports nothing usable) versus transient (a timeout or busy
-/// device worth retrying).
-fn dpi_error_is_permanent(error: &WriteError) -> bool {
-    matches!(
-        error,
-        WriteError::FeatureUnsupported { .. } | WriteError::EmptyDpiList
-    )
 }
 
 impl Global for AppState {}
