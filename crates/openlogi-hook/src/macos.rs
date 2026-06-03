@@ -16,7 +16,7 @@ use core_graphics::event::{
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use tracing::{debug, error, warn};
 
-use crate::scroll::{self, MIN_DEAD_ZONE, SharedSmooth};
+use crate::scroll::{self, AxisTuning, MIN_DEAD_ZONE, SharedSmooth};
 use crate::{ButtonId, EventDisposition, HookError, MouseEvent};
 
 type CVReturn = i32;
@@ -445,8 +445,12 @@ fn handle_scroll_event(
     driver.shared.push(
         if smooth_h { dx } else { 0.0 },
         if smooth_v { dy } else { 0.0 },
-        cfg.vertical_speed,
-        cfg.vertical_step,
+        AxisTuning {
+            horizontal_speed: cfg.horizontal_speed,
+            vertical_speed: cfg.vertical_speed,
+            horizontal_step: cfg.horizontal_step,
+            vertical_step: cfg.vertical_step,
+        },
         pid,
         || {
             // This push armed a previously idle engine — start the frame clock.

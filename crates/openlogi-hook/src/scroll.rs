@@ -45,6 +45,16 @@ pub fn is_trackpad(scroll_phase: f64, momentum_phase: f64, scroll_count: i64) ->
 /// Accumulates scroll deltas and emits per-frame interpolated output until it
 /// converges. The tap thread calls [`Self::add`]; the display-link thread
 /// calls [`Self::advance`].
+/// Per-axis smoothing distance tuning. Horizontal corresponds to macOS scroll
+/// axis 2 (thumb wheel); vertical corresponds to axis 1 (main wheel).
+#[derive(Debug, Clone, Copy)]
+pub struct AxisTuning {
+    pub horizontal_speed: f64,
+    pub vertical_speed: f64,
+    pub horizontal_step: f64,
+    pub vertical_step: f64,
+}
+
 #[derive(Debug, Default)]
 pub struct SmoothEngine {
     /// Target accumulated distance.
@@ -60,10 +70,10 @@ impl SmoothEngine {
     }
 
     /// Add an input tick (already inverted if applicable). `dx`/`dy` are the
-    /// raw event deltas; they are normalized to `step` then scaled by `speed`.
-    pub fn add(&mut self, dx: f64, dy: f64, speed: f64, step: f64) {
-        self.buffer.0 += normalize(dx, step) * speed;
-        self.buffer.1 += normalize(dy, step) * speed;
+    /// raw event deltas; they are normalized and scaled per axis.
+    pub fn add(&mut self, dx: f64, dy: f64, tuning: AxisTuning) {
+        self.buffer.0 += normalize(dx, tuning.horizontal_step) * tuning.horizontal_speed;
+        self.buffer.1 += normalize(dy, tuning.vertical_step) * tuning.vertical_speed;
     }
 
     /// Advance one frame. Returns the `(dx, dy)` to post this frame, or `None`
@@ -131,12 +141,12 @@ impl SharedSmooth {
     /// still held**, so the display-link start is ordered against a concurrent
     /// stop decision in [`Self::frame_or_stop`] and the two FFI calls can never
     /// reorder into a "stopped but running" wedge.
-    pub fn push(&self, dx: f64, dy: f64, speed: f64, step: f64, pid: i32, start: impl FnOnce()) {
+    pub fn push(&self, dx: f64, dy: f64, tuning: AxisTuning, pid: i32, start: impl FnOnce()) {
         let Ok(mut st) = self.state.lock() else {
             return;
         };
         st.target_pid = pid;
-        st.engine.add(dx, dy, speed, step);
+        st.engine.add(dx, dy, tuning);
         if !st.running {
             st.running = true;
             start();
@@ -178,6 +188,15 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
+    fn default_tuning() -> AxisTuning {
+        AxisTuning {
+            horizontal_speed: 1.0,
+            vertical_speed: 1.0,
+            horizontal_step: 0.0,
+            vertical_step: 0.0,
+        }
+    }
+
     #[test]
     fn duration_transition_matches_mos_formula() {
         assert_eq!(duration_to_transition(5.2), 0.0);
@@ -212,7 +231,7 @@ mod tests {
     #[test]
     fn engine_converges_and_then_idles() {
         let mut e = SmoothEngine::new();
-        e.add(0.0, 10.0, 1.0, 0.0); // buffer.1 = 10
+        e.add(0.0, 10.0, default_tuning()); // buffer.1 = 10
         let mut emitted = 0.0;
         let mut frames = 0;
         while let Some((_, dy)) = e.advance(0.5, 0.5) {
@@ -232,10 +251,46 @@ mod tests {
     }
 
     #[test]
+    fn engine_scales_each_axis_with_its_own_speed() {
+        let mut e = SmoothEngine::new();
+        e.add(
+            1.0,
+            1.0,
+            AxisTuning {
+                horizontal_speed: 2.0,
+                vertical_speed: 4.0,
+                horizontal_step: 1.0,
+                vertical_step: 1.0,
+            },
+        );
+        let (dx, dy) = e.advance(1.0, 0.1).expect("frame");
+        assert!((dx - 2.0).abs() < f64::EPSILON);
+        assert!((dy - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn engine_normalizes_each_axis_with_its_own_step() {
+        let mut e = SmoothEngine::new();
+        e.add(
+            0.5,
+            0.5,
+            AxisTuning {
+                horizontal_speed: 1.0,
+                vertical_speed: 1.0,
+                horizontal_step: 3.0,
+                vertical_step: 7.0,
+            },
+        );
+        let (dx, dy) = e.advance(1.0, 0.1).expect("frame");
+        assert!((dx - 3.0).abs() < f64::EPSILON);
+        assert!((dy - 7.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn shared_smooth_drains_to_none() {
         let s = SharedSmooth::new();
         let started = Cell::new(false);
-        s.push(0.0, 10.0, 1.0, 0.0, 1234, || started.set(true));
+        s.push(0.0, 10.0, default_tuning(), 1234, || started.set(true));
         assert!(started.get(), "idle push must start the link");
         let mut got = 0.0;
         while let Some((_, dy, pid)) = s.frame_or_stop(0.5, 0.5, || {}) {
@@ -249,15 +304,15 @@ mod tests {
     fn push_starts_only_when_idle() {
         let s = SharedSmooth::new();
         let starts = Cell::new(0u32);
-        s.push(0.0, 10.0, 1.0, 0.0, 1, || starts.set(starts.get() + 1)); // idle → start
-        s.push(0.0, 10.0, 1.0, 0.0, 1, || starts.set(starts.get() + 1)); // running → no start
+        s.push(0.0, 10.0, default_tuning(), 1, || starts.set(starts.get() + 1)); // idle → start
+        s.push(0.0, 10.0, default_tuning(), 1, || starts.set(starts.get() + 1)); // running → no start
         assert_eq!(starts.get(), 1);
     }
 
     #[test]
     fn frame_or_stop_invokes_stop_when_settled() {
         let s = SharedSmooth::new();
-        s.push(0.0, 10.0, 1.0, 0.0, 1, || {});
+        s.push(0.0, 10.0, default_tuning(), 1, || {});
         let stopped = Cell::new(false);
         while s.frame_or_stop(0.5, 0.5, || stopped.set(true)).is_some() {}
         assert!(stopped.get(), "settling must stop the link");
@@ -266,10 +321,10 @@ mod tests {
     #[test]
     fn push_after_settle_restarts() {
         let s = SharedSmooth::new();
-        s.push(0.0, 10.0, 1.0, 0.0, 1, || {});
+        s.push(0.0, 10.0, default_tuning(), 1, || {});
         while s.frame_or_stop(0.5, 0.5, || {}).is_some() {}
         let restarted = Cell::new(false);
-        s.push(0.0, 10.0, 1.0, 0.0, 1, || restarted.set(true)); // idle again → restart
+        s.push(0.0, 10.0, default_tuning(), 1, || restarted.set(true)); // idle again → restart
         assert!(restarted.get(), "a push after settle must restart the link");
     }
 }
