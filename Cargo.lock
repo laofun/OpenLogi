@@ -4544,6 +4544,7 @@ dependencies = [
 name = "openlogi-hook"
 version = "0.4.0"
 dependencies = [
+ "arc-swap",
  "cocoa 0.26.0",
  "core-foundation 0.10.0",
  "core-graphics 0.25.0",

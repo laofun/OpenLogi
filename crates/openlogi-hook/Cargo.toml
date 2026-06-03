@@ -12,6 +12,7 @@ description = "OS-level mouse-event hook for OpenLogi. macOS via CGEventTap; Lin
 openlogi-core = { path = "../openlogi-core", version = "0.4.0" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+arc-swap = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { workspace = true }

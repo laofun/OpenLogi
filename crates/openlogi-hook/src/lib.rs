@@ -200,5 +200,12 @@ pub fn frontmost_bundle_id() -> Option<String> {
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[allow(
+    dead_code,
+    reason = "consumed by the macOS smooth-scroll FFI added in a later task; \
+              for now only the in-module unit tests reference it"
+)]
+mod scroll;
+
 #[cfg(test)]
 mod tests;
