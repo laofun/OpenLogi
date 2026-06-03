@@ -119,3 +119,4 @@ the `SCHEMA_VERSION` in `config.rs`.
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — full dev workflow + packaging.
 - [`docs/USAGE.md`](docs/USAGE.md) — the CLI reference.
 - [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — the config file format.
+- [`docs/FORK-DIVERGENCE.md`](docs/FORK-DIVERGENCE.md) — what this fork changes vs upstream (MX Master 2S support) + the post-merge checklist. Read before merging `upstream/master`.

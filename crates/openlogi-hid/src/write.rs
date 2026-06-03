@@ -9,22 +9,19 @@
 
 use std::sync::Arc;
 
-use hidpp::feature::device_information::{DeviceInformation, DeviceInformationFeature};
-use hidpp::feature::smartshift::{SmartShiftFeature, WheelMode};
-use hidpp::feature::unified_battery::{
-    BatteryLevel as HidppBatteryLevel, BatteryStatus as HidppBatteryStatus, UnifiedBatteryFeature,
+use hidpp::{
+    channel::HidppChannel,
+    device::Device,
+    feature::CreatableFeature,
+    feature::adjustable_dpi::AdjustableDpiFeature,
+    protocol::v20::{ErrorType, Hidpp20Error},
 };
-use hidpp::{channel::HidppChannel, device::Device, feature::CreatableFeature};
-use openlogi_core::device::{BatteryInfo, BatteryLevel, BatteryStatus, DeviceTransports};
 use thiserror::Error;
 use tracing::debug;
 
-use crate::adjustable_dpi::AdjustableDpiFeatureV0;
-use crate::reprog_controls::{
-    CtrlIdInfo, FEATURE_ID as REPROG_CONTROLS_FEATURE_ID, ReprogControlsV4,
-};
 use crate::route::{DeviceRoute, open_route_channel};
-use crate::smartshift::{SmartShiftFeatureV0, SmartShiftMode, SmartShiftStatus};
+use crate::smartshift::{SmartShiftMode, SmartShiftStatus};
+use crate::smartshift_backend::SmartShift;
 
 #[derive(Debug, Error)]
 pub enum WriteError {
@@ -36,8 +33,113 @@ pub enum WriteError {
     DeviceUnreachable { index: u8 },
     #[error("device does not expose HID++ feature {feature_hex:#06x}")]
     FeatureUnsupported { feature_hex: u16 },
+    #[error("device returned no supported DPI values")]
+    EmptyDpiList,
     #[error("HID++ protocol error: {0}")]
     Hidpp(String),
+}
+
+/// Supported DPI values reported by a device's HID++ AdjustableDpi feature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DpiCapabilities {
+    values: Vec<u16>,
+}
+
+impl DpiCapabilities {
+    /// Build capabilities from a device-reported DPI list. Values are sorted
+    /// and deduplicated so callers can rely on stable ordering.
+    pub fn new(mut values: Vec<u16>) -> Result<Self, WriteError> {
+        values.sort_unstable();
+        values.dedup();
+        if values.is_empty() {
+            return Err(WriteError::EmptyDpiList);
+        }
+        Ok(Self { values })
+    }
+
+    /// All supported DPI values, sorted ascending.
+    #[must_use]
+    pub fn values(&self) -> &[u16] {
+        &self.values
+    }
+
+    /// Minimum supported DPI.
+    #[must_use]
+    pub fn min(&self) -> u16 {
+        self.values[0]
+    }
+
+    /// Maximum supported DPI.
+    #[must_use]
+    pub fn max(&self) -> u16 {
+        self.values[self.values.len() - 1]
+    }
+
+    /// Whether `dpi` is exactly supported by the device.
+    #[must_use]
+    pub fn contains(&self, dpi: u16) -> bool {
+        self.values.binary_search(&dpi).is_ok()
+    }
+
+    /// The supported DPI nearest to `dpi`.
+    #[must_use]
+    pub fn nearest(&self, dpi: u32) -> u16 {
+        let mut nearest = self.values[0];
+        let mut best_delta = u32::from(nearest).abs_diff(dpi);
+        for &candidate in &self.values[1..] {
+            let delta = u32::from(candidate).abs_diff(dpi);
+            if delta < best_delta {
+                nearest = candidate;
+                best_delta = delta;
+            }
+        }
+        nearest
+    }
+
+    /// Snap `dpi` to the nearest supported value, widened to `u32` for UI math.
+    /// The single home for "round a DPI onto this device's grid" — callers that
+    /// hold an `Option<DpiCapabilities>` should `map_or(dpi, |c| c.snap(dpi))`.
+    #[must_use]
+    pub fn snap(&self, dpi: u32) -> u32 {
+        u32::from(self.nearest(dpi))
+    }
+
+    /// Best-effort step size for UI widgets that need a single increment.
+    /// Returns the smallest positive gap between adjacent reported values.
+    #[must_use]
+    pub fn step_hint(&self) -> u16 {
+        self.values
+            .windows(2)
+            .filter_map(|pair| pair[1].checked_sub(pair[0]))
+            .filter(|step| *step > 0)
+            .min()
+            .unwrap_or(1)
+    }
+
+    /// A supported value different from `current`, for diagnostic write tests.
+    #[must_use]
+    pub fn adjacent_test_target(&self, current: u16) -> Option<u16> {
+        if self.values.len() < 2 {
+            return None;
+        }
+        match self.values.binary_search(&current) {
+            Ok(index) if index + 1 < self.values.len() => Some(self.values[index + 1]),
+            Ok(index) if index > 0 => Some(self.values[index - 1]),
+            Ok(_) => None,
+            Err(index) if index < self.values.len() => Some(self.values[index]),
+            Err(_) => self.values.last().copied(),
+        }
+        .filter(|target| *target != current)
+    }
+}
+
+/// Current DPI plus the supported values reported by the device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DpiInfo {
+    /// DPI currently configured on sensor 0.
+    pub current: u16,
+    /// Supported values reported by the device for sensor 0.
+    pub capabilities: DpiCapabilities,
 }
 
 /// Snapshot of one HID++ feature exposed by a device: protocol ID +
@@ -46,41 +148,6 @@ pub enum WriteError {
 pub struct FeatureEntry {
     pub id: u16,
     pub version: u8,
-}
-
-#[derive(Debug)]
-pub struct BatteryFeatureSummary {
-    pub battery_status_present: bool,
-    pub battery_voltage_present: bool,
-    pub unified_battery_present: bool,
-    /// Decoded `0x1004 UnifiedBattery` reading, if that feature is present.
-    pub unified_battery: Result<Option<BatteryInfo>, WriteError>,
-    /// Decoded `0x1000 BatteryStatus` reading, if that feature is present.
-    /// `Ok(None)` when the feature reports a `0%` "unknown" sentinel.
-    pub legacy_battery: Result<Option<BatteryInfo>, WriteError>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ControlEntry {
-    pub index: u8,
-    pub info: CtrlIdInfo,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DpiReference {
-    pub min: u16,
-    pub max: u16,
-    pub step: u16,
-    pub source: &'static str,
-}
-
-#[derive(Debug, Clone)]
-pub struct DeviceIdentitySummary {
-    pub config_key: Option<String>,
-    pub model_ids: Option<[u16; 3]>,
-    pub extended_model_id: Option<u8>,
-    pub transports: Option<DeviceTransports>,
-    pub dpi_reference: Option<DpiReference>,
 }
 
 /// Enumerate every HID++ feature the device on `route` reports — used by
@@ -133,15 +200,12 @@ async fn dump_features_on_device(device: &mut Device) -> Result<Vec<FeatureEntry
 /// Look up `F` on a device by HID++ feature ID, register it with
 /// [`Device::add_feature`], and return the typed wrapper.
 ///
-/// We bypass [`Device::enumerate_features`] because hidpp 0.2's central
-/// registry has `versions: &[]` for the features OpenLogi cares about
-/// (`0x2201 AdjustableDpi`, `0x2202 ExtendedAdjustableDpi`). Calling
-/// `enumerate_features` ends up _not_ registering them, so a subsequent
-/// `device.get_feature::<F>()` looking up our own TypeId returns `None`
-/// even when the device announces the feature ID. The direct lookup via
-/// `root().get_feature(id)` returns the assigned index unconditionally;
-/// `add_feature` then attaches our wrapper to that index.
-async fn open_feature<F: CreatableFeature + 'static>(
+/// The direct lookup via `root().get_feature(id)` returns the assigned index
+/// unconditionally; `add_feature` then attaches our wrapper to that index. This
+/// keeps route-based write/read paths independent from full feature-table
+/// enumeration and also works for feature wrappers that are not in the central
+/// registry yet.
+pub(crate) async fn open_feature<F: CreatableFeature + 'static>(
     device: &mut Device,
 ) -> Result<Arc<F>, WriteError> {
     let info = device
@@ -153,329 +217,13 @@ async fn open_feature<F: CreatableFeature + 'static>(
     Ok(device.add_feature::<F>(info.index))
 }
 
-async fn feature_present(device: &Device, feature_id: u16) -> Result<bool, WriteError> {
+pub(crate) async fn feature_present(device: &Device, feature_id: u16) -> Result<bool, WriteError> {
     device
         .root()
         .get_feature(feature_id)
         .await
         .map(|hit| hit.is_some())
         .map_err(|e| WriteError::Hidpp(format!("{e:?}")))
-}
-
-fn map_battery_level(level: HidppBatteryLevel) -> BatteryLevel {
-    match level {
-        HidppBatteryLevel::Critical => BatteryLevel::Critical,
-        HidppBatteryLevel::Low => BatteryLevel::Low,
-        HidppBatteryLevel::Good => BatteryLevel::Good,
-        HidppBatteryLevel::Full => BatteryLevel::Full,
-        _ => BatteryLevel::Unknown,
-    }
-}
-
-fn map_battery_status(status: HidppBatteryStatus) -> BatteryStatus {
-    match status {
-        HidppBatteryStatus::Discharging => BatteryStatus::Discharging,
-        HidppBatteryStatus::Charging => BatteryStatus::Charging,
-        HidppBatteryStatus::ChargingSlow => BatteryStatus::ChargingSlow,
-        HidppBatteryStatus::Full => BatteryStatus::Full,
-        HidppBatteryStatus::Error => BatteryStatus::Error,
-        _ => BatteryStatus::Unknown,
-    }
-}
-
-fn is_mx_master_2s_identity(model_ids: Option<[u16; 3]>, config_key: Option<&str>) -> bool {
-    config_key == Some("0b019")
-        || model_ids.is_some_and(|ids| ids.into_iter().any(|id| id == 0xb019))
-}
-
-fn mx_master_2s_dpi_reference() -> DpiReference {
-    DpiReference {
-        min: 200,
-        max: 4000,
-        step: 50,
-        source: "MX Master 2S reference (not protocol-verified)",
-    }
-}
-
-fn transports_from_info(info: &DeviceInformation) -> DeviceTransports {
-    DeviceTransports {
-        usb: info.transport.usb,
-        equad: info.transport.e_quad,
-        btle: info.transport.btle,
-        bluetooth: info.transport.bluetooth,
-    }
-}
-
-async fn read_identity_summary(device: &mut Device) -> Result<DeviceIdentitySummary, WriteError> {
-    let feature = match open_feature::<DeviceInformationFeature>(device).await {
-        Ok(feature) => feature,
-        Err(WriteError::FeatureUnsupported { .. }) => {
-            return Ok(DeviceIdentitySummary {
-                config_key: None,
-                model_ids: None,
-                extended_model_id: None,
-                transports: None,
-                dpi_reference: None,
-            });
-        }
-        Err(err) => return Err(err),
-    };
-    let info = feature
-        .get_device_info()
-        .await
-        .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
-    let model_ids = info.model_id;
-    let config_key = format!("{:x}{:04x}", info.extended_model_id, model_ids[0]);
-    let config_key = (config_key != "00000").then_some(config_key);
-    let dpi_reference = is_mx_master_2s_identity(Some(model_ids), config_key.as_deref())
-        .then_some(mx_master_2s_dpi_reference());
-    Ok(DeviceIdentitySummary {
-        config_key,
-        model_ids: Some(model_ids),
-        extended_model_id: Some(info.extended_model_id),
-        transports: Some(transports_from_info(&info)),
-        dpi_reference,
-    })
-}
-
-pub async fn battery_feature_summary(
-    route: &DeviceRoute,
-) -> Result<BatteryFeatureSummary, WriteError> {
-    let index = route.device_index();
-    with_route(route, move |channel| async move {
-        let mut device = Device::new(Arc::clone(&channel), index)
-            .await
-            .map_err(|_| WriteError::DeviceUnreachable { index })?;
-        let battery_status_present = feature_present(&device, 0x1000).await?;
-        let battery_voltage_present = feature_present(&device, 0x1001).await?;
-        let unified_battery_present = feature_present(&device, UnifiedBatteryFeature::ID).await?;
-        let unified_battery = if unified_battery_present {
-            match open_feature::<UnifiedBatteryFeature>(&mut device).await {
-                Ok(feature) => feature
-                    .get_battery_info()
-                    .await
-                    .map(|info| {
-                        Some(BatteryInfo {
-                            percentage: info.charging_percentage,
-                            level: map_battery_level(info.level),
-                            status: map_battery_status(info.status),
-                        })
-                    })
-                    .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
-                Err(err) => Err(err),
-            }
-        } else {
-            Ok(None)
-        };
-        let legacy_battery = if battery_status_present {
-            read_legacy_battery(&device, &channel, index).await
-        } else {
-            Ok(None)
-        };
-        Ok(BatteryFeatureSummary {
-            battery_status_present,
-            battery_voltage_present,
-            unified_battery_present,
-            unified_battery,
-            legacy_battery,
-        })
-    })
-    .await
-}
-
-/// Read and decode `0x1000 BatteryStatus`. Returns `Ok(None)` when the device
-/// reports the `0%` "unknown" sentinel (firmware not ready / degraded read).
-async fn read_legacy_battery(
-    device: &Device,
-    channel: &Arc<HidppChannel>,
-    index: u8,
-) -> Result<Option<BatteryInfo>, WriteError> {
-    use crate::battery_status::{
-        BatteryStatusFeature, FEATURE_ID as BATTERY_STATUS_FEATURE_ID, is_informative,
-    };
-    let info = device
-        .root()
-        .get_feature(BATTERY_STATUS_FEATURE_ID)
-        .await
-        .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?
-        .ok_or(WriteError::FeatureUnsupported {
-            feature_hex: BATTERY_STATUS_FEATURE_ID,
-        })?;
-    let feature = BatteryStatusFeature::new(Arc::clone(channel), index, info.index);
-    let battery = feature
-        .get_battery_info()
-        .await
-        .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
-    // Keep a 0% charging reading (percentage is the unknown sentinel, status is
-    // real); drop only a 0% discharging/unknown read.
-    Ok(is_informative(&battery).then_some(battery))
-}
-
-pub async fn dump_reprog_controls(route: &DeviceRoute) -> Result<Vec<ControlEntry>, WriteError> {
-    let index = route.device_index();
-    with_route(route, move |channel| async move {
-        let device = Device::new(Arc::clone(&channel), index)
-            .await
-            .map_err(|_| WriteError::DeviceUnreachable { index })?;
-        let info = device
-            .root()
-            .get_feature(REPROG_CONTROLS_FEATURE_ID)
-            .await
-            .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?
-            .ok_or(WriteError::FeatureUnsupported {
-                feature_hex: REPROG_CONTROLS_FEATURE_ID,
-            })?;
-        let feature = ReprogControlsV4::new(Arc::clone(&channel), index, info.index);
-        let count = feature
-            .get_count()
-            .await
-            .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
-        let mut controls = Vec::with_capacity(usize::from(count));
-        for index in 0..count {
-            let info = feature
-                .get_ctrl_id_info(index)
-                .await
-                .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
-            controls.push(ControlEntry { index, info });
-        }
-        Ok(controls)
-    })
-    .await
-}
-
-pub async fn device_identity_summary(
-    route: &DeviceRoute,
-) -> Result<DeviceIdentitySummary, WriteError> {
-    let index = route.device_index();
-    with_route(route, move |channel| async move {
-        let mut device = Device::new(Arc::clone(&channel), index)
-            .await
-            .map_err(|_| WriteError::DeviceUnreachable { index })?;
-        read_identity_summary(&mut device).await
-    })
-    .await
-}
-
-/// Whether a failure to open the `0x2111` Enhanced SmartShift feature should
-/// trigger the `0x2110` legacy fallback. Only a missing-`0x2111` feature
-/// qualifies; transport and protocol errors propagate unchanged so a real
-/// failure is never masked by a second open attempt.
-fn is_missing_enhanced(err: &WriteError) -> bool {
-    matches!(
-        err,
-        WriteError::FeatureUnsupported { feature_hex } if *feature_hex == 0x2111
-    )
-}
-
-/// Map the fork's `0x2110` [`WheelMode`] onto OpenLogi's [`SmartShiftMode`].
-/// A future `#[non_exhaustive]` variant maps to [`SmartShiftMode::Ratchet`],
-/// the "safe" clicky default OpenLogi uses elsewhere. (Reserved wire bytes
-/// never reach here — the fork's `get_ratchet_control_mode` rejects them.)
-fn wheel_mode_to_smartshift(wheel: WheelMode) -> SmartShiftMode {
-    if matches!(wheel, WheelMode::Freespin) {
-        SmartShiftMode::Free
-    } else {
-        SmartShiftMode::Ratchet
-    }
-}
-
-/// Map OpenLogi's [`SmartShiftMode`] onto the fork's `0x2110` [`WheelMode`] —
-/// the inverse of [`wheel_mode_to_smartshift`], used when writing the legacy
-/// ratchet-control mode.
-fn smartshift_to_wheel(mode: SmartShiftMode) -> WheelMode {
-    match mode {
-        SmartShiftMode::Free => WheelMode::Freespin,
-        SmartShiftMode::Ratchet => WheelMode::Ratchet,
-    }
-}
-
-/// Whichever SmartShift feature a device exposes, normalised onto
-/// [`SmartShiftMode`]. Devices ship one or the other: MX Master 3 / 3S use the
-/// `0x2111` Enhanced variant, the MX Master 2S uses the original `0x2110`.
-enum SmartShift {
-    /// `0x2111 SmartShiftWheelEnhanced`.
-    Enhanced(Arc<SmartShiftFeatureV0>),
-    /// `0x2110 SmartShiftWheel`.
-    Legacy(Arc<SmartShiftFeature>),
-}
-
-impl SmartShift {
-    /// Open whichever SmartShift feature the device exposes. Tries `0x2111`
-    /// first; on a missing-`0x2111` error (and only that), retries with
-    /// `0x2110`. Any other error from the first attempt propagates unchanged.
-    async fn open(device: &mut Device) -> Result<Self, WriteError> {
-        match open_feature::<SmartShiftFeatureV0>(device).await {
-            Ok(feature) => Ok(Self::Enhanced(feature)),
-            Err(err) if is_missing_enhanced(&err) => {
-                let feature = open_feature::<SmartShiftFeature>(device).await?;
-                Ok(Self::Legacy(feature))
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    /// Read the current mode (and, for Enhanced, the sensitivity; for Legacy,
-    /// the auto-disengage threshold reported as `sensitivity`).
-    async fn status(&self) -> Result<SmartShiftStatus, WriteError> {
-        match self {
-            Self::Enhanced(feature) => feature
-                .get_status()
-                .await
-                .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
-            Self::Legacy(feature) => {
-                let rcm = feature
-                    .get_ratchet_control_mode()
-                    .await
-                    .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
-                Ok(SmartShiftStatus {
-                    mode: wheel_mode_to_smartshift(rcm.wheel_mode),
-                    sensitivity: rcm.auto_disengage,
-                })
-            }
-        }
-    }
-
-    /// Write a new mode. `sensitivity` is preserved on Enhanced; on Legacy the
-    /// auto-disengage threshold is left unchanged (`None`).
-    async fn set_mode(&self, mode: SmartShiftMode, sensitivity: u8) -> Result<(), WriteError> {
-        match self {
-            Self::Enhanced(feature) => feature
-                .set_status(mode, sensitivity)
-                .await
-                .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
-            Self::Legacy(feature) => feature
-                .set_ratchet_control_mode(Some(smartshift_to_wheel(mode)), None, None)
-                .await
-                .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
-        }
-    }
-
-    /// Write a new auto-disengage `sensitivity`, preserving the current mode.
-    ///
-    /// The two features keep the mode differently:
-    /// - `0x2111` (Enhanced) `set_status` has no "keep current" sentinel — it
-    ///   always takes a mode — so we read the current mode and write it back
-    ///   alongside the new threshold.
-    /// - `0x2110` (Legacy) `set_ratchet_control_mode` treats `wheel_mode = None`
-    ///   as "leave unchanged" (the fork's documented contract), so we pass
-    ///   `None` and touch only the threshold. Re-writing a just-read mode there
-    ///   risks persisting a stale / misread value back to the device — on the
-    ///   MX Master 2S that flipped Ratchet → Free.
-    async fn set_sensitivity(&self, value: u8) -> Result<(), WriteError> {
-        match self {
-            Self::Enhanced(feature) => {
-                let SmartShiftStatus { mode, .. } = self.status().await?;
-                feature
-                    .set_status(mode, value)
-                    .await
-                    .map_err(|e| WriteError::Hidpp(format!("{e:?}")))
-            }
-            Self::Legacy(feature) => feature
-                .set_ratchet_control_mode(None, Some(value), None)
-                .await
-                .map_err(|e| WriteError::Hidpp(format!("{e:?}"))),
-        }
-    }
 }
 
 /// Read the device's current DPI on sensor 0 — companion to [`set_dpi`].
@@ -487,11 +235,63 @@ pub async fn get_dpi(route: &DeviceRoute) -> Result<u16, WriteError> {
         let mut device = Device::new(Arc::clone(&channel), index)
             .await
             .map_err(|_| WriteError::DeviceUnreachable { index })?;
-        let feature = open_feature::<AdjustableDpiFeatureV0>(&mut device).await?;
+        let feature = open_feature::<AdjustableDpiFeature>(&mut device).await?;
         feature
             .get_sensor_dpi(0)
             .await
             .map_err(|e| WriteError::Hidpp(format!("{e:?}")))
+    })
+    .await
+}
+
+/// Classify a HID++ error from the AdjustableDpi functions. A device that
+/// announces `0x2201` but rejects a function (`Unsupported` /
+/// `InvalidFunctionId`) or returns a structurally invalid DPI list
+/// (`UnsupportedResponse`) will keep doing so, so these map to the permanent
+/// [`WriteError::FeatureUnsupported`]; channel/timeout errors stay transient
+/// [`WriteError::Hidpp`] so callers may retry.
+fn classify_dpi_error(error: Hidpp20Error) -> WriteError {
+    match error {
+        Hidpp20Error::Feature(ErrorType::Unsupported | ErrorType::InvalidFunctionId)
+        | Hidpp20Error::UnsupportedResponse => WriteError::FeatureUnsupported {
+            feature_hex: AdjustableDpiFeature::ID,
+        },
+        other => WriteError::Hidpp(format!("{other:?}")),
+    }
+}
+
+/// Read the current DPI and the supported DPI values for sensor 0 in one
+/// route/channel session.
+pub async fn get_dpi_info(route: &DeviceRoute) -> Result<DpiInfo, WriteError> {
+    let index = route.device_index();
+    with_route(route, move |channel| async move {
+        let mut device = Device::new(Arc::clone(&channel), index)
+            .await
+            .map_err(|_| WriteError::DeviceUnreachable { index })?;
+        let feature = open_feature::<AdjustableDpiFeature>(&mut device).await?;
+        let sensor_count = feature
+            .get_sensor_count()
+            .await
+            .map_err(classify_dpi_error)?;
+        if sensor_count == 0 {
+            // The device claims AdjustableDpi but exposes no sensor — it cannot
+            // report DPI, and that won't change on retry.
+            return Err(WriteError::FeatureUnsupported {
+                feature_hex: AdjustableDpiFeature::ID,
+            });
+        }
+        let current = feature
+            .get_sensor_dpi(0)
+            .await
+            .map_err(classify_dpi_error)?;
+        let values = feature
+            .get_sensor_dpi_list(0)
+            .await
+            .map_err(classify_dpi_error)?;
+        Ok(DpiInfo {
+            current,
+            capabilities: DpiCapabilities::new(values)?,
+        })
     })
     .await
 }
@@ -555,7 +355,7 @@ async fn set_dpi_on_channel(
     let mut device = Device::new(Arc::clone(channel), index)
         .await
         .map_err(|_| WriteError::DeviceUnreachable { index })?;
-    let feature = open_feature::<AdjustableDpiFeatureV0>(&mut device).await?;
+    let feature = open_feature::<AdjustableDpiFeature>(&mut device).await?;
     feature
         .set_sensor_dpi(0, dpi)
         .await
@@ -656,7 +456,7 @@ pub async fn toggle_smartshift_on(shared: &SharedChannel) -> Result<SmartShiftMo
 
 /// Boilerplate-eater: open the channel that reaches `route`, then run `f` once
 /// with it. The caller addresses features at [`DeviceRoute::device_index`].
-async fn with_route<F, Fut, T>(route: &DeviceRoute, f: F) -> Result<T, WriteError>
+pub(crate) async fn with_route<F, Fut, T>(route: &DeviceRoute, f: F) -> Result<T, WriteError>
 where
     F: FnOnce(Arc<HidppChannel>) -> Fut,
     Fut: std::future::Future<Output = Result<T, WriteError>>,
@@ -670,59 +470,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::smartshift::SmartShiftMode;
 
     #[test]
-    fn smartshift_and_wheel_mode_byte_encodings_match() {
-        // The whole design relies on 0x2110 WheelMode and 0x2111
-        // SmartShiftMode sharing one wire encoding (Free/Freespin = 1,
-        // Ratchet = 2). If the fork ever renumbers WheelMode this fails loudly.
-        assert_eq!(SmartShiftMode::Free.as_byte(), WheelMode::Freespin as u8);
-        assert_eq!(SmartShiftMode::Ratchet.as_byte(), WheelMode::Ratchet as u8);
+    fn capabilities_sort_and_deduplicate_values() -> Result<(), WriteError> {
+        let caps = DpiCapabilities::new(vec![1600, 400, 800, 800])?;
+
+        assert_eq!(caps.values(), [400, 800, 1600]);
+        assert_eq!(caps.min(), 400);
+        assert_eq!(caps.max(), 1600);
+        Ok(())
     }
 
     #[test]
-    fn wheel_mode_maps_to_smartshift_mode() {
-        assert_eq!(
-            wheel_mode_to_smartshift(WheelMode::Freespin),
-            SmartShiftMode::Free
-        );
-        assert_eq!(
-            wheel_mode_to_smartshift(WheelMode::Ratchet),
-            SmartShiftMode::Ratchet
-        );
+    fn capabilities_reject_empty_list() {
+        assert!(matches!(
+            DpiCapabilities::new(Vec::new()),
+            Err(WriteError::EmptyDpiList)
+        ));
     }
 
     #[test]
-    fn smartshift_to_wheel_round_trips() {
-        // smartshift_to_wheel is the inverse of wheel_mode_to_smartshift.
-        for mode in [SmartShiftMode::Free, SmartShiftMode::Ratchet] {
-            assert_eq!(wheel_mode_to_smartshift(smartshift_to_wheel(mode)), mode);
-        }
+    fn nearest_returns_closest_supported_value() -> Result<(), WriteError> {
+        let caps = DpiCapabilities::new(vec![400, 800, 1600])?;
+
+        assert_eq!(caps.nearest(390), 400);
+        assert_eq!(caps.nearest(1000), 800);
+        assert_eq!(caps.nearest(2000), 1600);
+        Ok(())
     }
 
     #[test]
-    fn missing_enhanced_triggers_fallback() {
-        assert!(is_missing_enhanced(&WriteError::FeatureUnsupported {
-            feature_hex: 0x2111,
-        }));
+    fn step_hint_returns_smallest_positive_gap() -> Result<(), WriteError> {
+        let caps = DpiCapabilities::new(vec![400, 800, 1200, 2000])?;
+
+        assert_eq!(caps.step_hint(), 400);
+        Ok(())
     }
 
     #[test]
-    fn missing_legacy_does_not_trigger_fallback() {
-        // A device missing 0x2110 must NOT loop back — it genuinely has no
-        // SmartShift.
-        assert!(!is_missing_enhanced(&WriteError::FeatureUnsupported {
-            feature_hex: 0x2110,
-        }));
+    fn adjacent_test_target_prefers_next_then_previous_value() -> Result<(), WriteError> {
+        let caps = DpiCapabilities::new(vec![400, 800, 1600])?;
+
+        assert_eq!(caps.adjacent_test_target(400), Some(800));
+        assert_eq!(caps.adjacent_test_target(800), Some(1600));
+        assert_eq!(caps.adjacent_test_target(1600), Some(800));
+        Ok(())
     }
 
     #[test]
-    fn transport_errors_do_not_trigger_fallback() {
-        // Real failures must propagate, not be masked by a fallback attempt.
-        assert!(!is_missing_enhanced(&WriteError::DeviceUnreachable {
-            index: 0xff,
-        }));
-        assert!(!is_missing_enhanced(&WriteError::Hidpp("boom".into())));
+    fn adjacent_test_target_handles_current_outside_list() -> Result<(), WriteError> {
+        let caps = DpiCapabilities::new(vec![400, 800, 1600])?;
+
+        assert_eq!(caps.adjacent_test_target(1000), Some(1600));
+        assert_eq!(caps.adjacent_test_target(2000), Some(1600));
+        Ok(())
     }
 }

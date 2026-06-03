@@ -18,9 +18,13 @@ use std::sync::Arc;
 
 use hidpp::{
     channel::HidppChannel,
+    device::Device,
     nibble::U4,
     protocol::v20::{self, Hidpp20Error},
 };
+
+use crate::route::DeviceRoute;
+use crate::write::{WriteError, with_route};
 
 /// `ReprogControlsV4` HID++ feature ID.
 pub const FEATURE_ID: u16 = 0x1b04;
@@ -264,6 +268,49 @@ impl ReprogControlsV4 {
         self.call(FN_SET_CID_REPORTING, params).await?;
         Ok(())
     }
+}
+
+/// One reprogrammable control plus its table index, as returned by
+/// [`dump_reprog_controls`] for the `openlogi diag controls` diagnostic.
+#[derive(Debug, Clone)]
+pub struct ControlEntry {
+    pub index: u8,
+    pub info: CtrlIdInfo,
+}
+
+/// Enumerate every reprogrammable control (`0x1b04`) the device on `route`
+/// exposes — used by `openlogi diag controls` to confirm which buttons can be
+/// diverted (gesture button, DPI/ModeShift family).
+pub async fn dump_reprog_controls(route: &DeviceRoute) -> Result<Vec<ControlEntry>, WriteError> {
+    let index = route.device_index();
+    with_route(route, move |channel| async move {
+        let device = Device::new(Arc::clone(&channel), index)
+            .await
+            .map_err(|_| WriteError::DeviceUnreachable { index })?;
+        let info = device
+            .root()
+            .get_feature(FEATURE_ID)
+            .await
+            .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?
+            .ok_or(WriteError::FeatureUnsupported {
+                feature_hex: FEATURE_ID,
+            })?;
+        let feature = ReprogControlsV4::new(Arc::clone(&channel), index, info.index);
+        let count = feature
+            .get_count()
+            .await
+            .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+        let mut controls = Vec::with_capacity(usize::from(count));
+        for index in 0..count {
+            let info = feature
+                .get_ctrl_id_info(index)
+                .await
+                .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+            controls.push(ControlEntry { index, info });
+        }
+        Ok(controls)
+    })
+    .await
 }
 
 #[cfg(test)]
