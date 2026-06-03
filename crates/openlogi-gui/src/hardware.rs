@@ -14,7 +14,9 @@
 
 use std::time::Duration;
 
-use openlogi_hid::{CaptureChannel, DeviceRoute, DpiInfo, SharedChannel, WriteError};
+use openlogi_hid::{
+    CaptureChannel, DeviceRoute, DpiInfo, SharedChannel, SmartShiftMode, WriteError,
+};
 use tracing::{debug, warn};
 
 /// Upper bound on a single HID++ write. `hidpp` has no request timeout of its
@@ -22,6 +24,20 @@ use tracing::{debug, warn};
 /// this background thread forever; a write to a live device completes in well
 /// under a second.
 const WRITE_BUDGET: Duration = Duration::from_secs(5);
+
+#[must_use]
+pub fn smartshift_percent_to_raw(percent: u8) -> u8 {
+    let clamped = u16::from(percent.min(100));
+    let raw = 1 + ((clamped * 254 + 50) / 100);
+    u8::try_from(raw).unwrap_or(255)
+}
+
+#[must_use]
+pub fn smartshift_raw_to_percent(raw: u8) -> u8 {
+    let raw = u16::from(raw.max(1));
+    let percent = ((raw - 1) * 100 + 127) / 254;
+    u8::try_from(percent).unwrap_or(100)
+}
 
 /// Read the current DPI and supported DPI values on a background worker.
 ///
@@ -95,6 +111,53 @@ pub fn toggle_smartshift_in_background(
             Err(_) => warn!(
                 index,
                 "SmartShift toggle timed out (device asleep/unresponsive)"
+            ),
+        }
+    });
+}
+
+/// Spawn an OS thread that sets SmartShift to a known mode on the target device,
+/// preserving the current sensitivity. Returns immediately; failures are logged.
+pub fn set_smartshift_mode_in_background(
+    capture: Option<&CaptureChannel>,
+    target: Option<DeviceRoute>,
+    mode: SmartShiftMode,
+) {
+    let Some(target) = target else {
+        debug!(?mode, "no target device — SmartShift mode set skipped");
+        return;
+    };
+    let shared = reusable_channel(capture, &target);
+    let reused = shared.is_some();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                warn!(error = %e, "tokio runtime init failed; SmartShift mode set skipped");
+                return;
+            }
+        };
+        let result = rt.block_on(async {
+            tokio::time::timeout(WRITE_BUDGET, async {
+                match &shared {
+                    Some(shared) => openlogi_hid::set_smartshift_mode_on(shared, mode).await,
+                    None => openlogi_hid::set_smartshift_mode(&target, mode).await,
+                }
+            })
+            .await
+        });
+        let index = target.device_index();
+        match result {
+            Ok(Ok(status)) => {
+                debug!(index, ?mode, applied = ?status.mode, reused, "SmartShift mode set")
+            }
+            Ok(Err(e)) => warn!(error = ?e, "SmartShift mode set failed"),
+            Err(_) => warn!(
+                index,
+                "SmartShift mode set timed out (device asleep/unresponsive)"
             ),
         }
     });
@@ -208,4 +271,24 @@ pub fn write_dpi_in_background(
             ),
         }
     });
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smartshift_percent_maps_to_hid_range() {
+        assert_eq!(smartshift_percent_to_raw(0), 1);
+        assert_eq!(smartshift_percent_to_raw(100), 255);
+        assert_eq!(smartshift_percent_to_raw(10), 26);
+    }
+
+    #[test]
+    fn smartshift_raw_maps_to_percent() {
+        assert_eq!(smartshift_raw_to_percent(1), 0);
+        assert_eq!(smartshift_raw_to_percent(255), 100);
+        assert_eq!(smartshift_raw_to_percent(25), 9);
+    }
 }
