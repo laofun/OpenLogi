@@ -8,8 +8,8 @@
 //! opened (see `main.rs`'s post-grant push).
 
 use gpui::{
-    AppContext as _, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled,
-    Subscription, Window, div, px,
+    AppContext as _, BorrowAppContext as _, Context, Entity, IntoElement, ParentElement, Render,
+    SharedString, Styled, Subscription, Window, div, px,
 };
 use gpui_component::{
     h_flex,
@@ -79,7 +79,7 @@ impl ScrollPanel {
             cx.subscribe(&speed, |this, _slider, event: &SliderEvent, cx| {
                 if let SliderEvent::Release(v) = event {
                     this.settings.speed = f64::from(v.start());
-                    this.on_change();
+                    this.on_change(cx);
                     cx.notify();
                 }
             }),
@@ -88,7 +88,7 @@ impl ScrollPanel {
             cx.subscribe(&step, |this, _slider, event: &SliderEvent, cx| {
                 if let SliderEvent::Release(v) = event {
                     this.settings.step = f64::from(v.start());
-                    this.on_change();
+                    this.on_change(cx);
                     cx.notify();
                 }
             }),
@@ -97,7 +97,7 @@ impl ScrollPanel {
             cx.subscribe(&duration, |this, _slider, event: &SliderEvent, cx| {
                 if let SliderEvent::Release(v) = event {
                     this.settings.duration = f64::from(v.start());
-                    this.on_change();
+                    this.on_change(cx);
                     cx.notify();
                 }
             }),
@@ -106,7 +106,7 @@ impl ScrollPanel {
             cx.subscribe(&dead_zone, |this, _slider, event: &SliderEvent, cx| {
                 if let SliderEvent::Release(v) = event {
                     this.settings.dead_zone = f64::from(v.start());
-                    this.on_change();
+                    this.on_change(cx);
                     cx.notify();
                 }
             }),
@@ -123,9 +123,15 @@ impl ScrollPanel {
     }
 
     /// Push the current settings to the live hook and persist them to disk.
-    fn on_change(&mut self) {
-        hook_runtime::push_scroll_settings(self.settings.clone());
-        persist(&self.settings);
+    fn on_change(&mut self, cx: &mut Context<Self>) {
+        let settings = self.settings.clone();
+        // Live push to the running hook (lock-free ArcSwap).
+        hook_runtime::push_scroll_settings(settings.clone());
+        // Persist through AppState's in-memory config so other full-file saves
+        // (device select, DPI presets) can't revert these edits.
+        cx.update_global::<crate::state::AppState, _>(move |state, _| {
+            state.commit_scroll_settings(settings);
+        });
     }
 
     /// One labelled boolean toggle row. `set` writes the toggled value back into
@@ -145,23 +151,10 @@ impl ScrollPanel {
             .child(Switch::new(id).checked(checked).on_click(cx.listener(
                 move |this, checked: &bool, _window, cx| {
                     set(&mut this.settings, *checked);
-                    this.on_change();
+                    this.on_change(cx);
                     cx.notify();
                 },
             )))
-    }
-}
-
-/// Write `settings` to `config.toml`, logging (not crashing) on failure.
-fn persist(settings: &ScrollSettings) {
-    match openlogi_core::config::Config::load_or_default() {
-        Ok(mut cfg) => {
-            cfg.set_scroll_settings(settings.clone());
-            if let Err(e) = cfg.save_atomic() {
-                tracing::warn!(error = %e, "failed to persist scroll settings");
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "failed to load config to persist scroll settings"),
     }
 }
 

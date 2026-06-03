@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use gpui::Global;
-use openlogi_core::config::{AppSettings, Config};
+use openlogi_core::config::{AppSettings, Config, ScrollSettings};
 use openlogi_core::device::DeviceInventory;
 use openlogi_hid::{DeviceRoute, DpiCapabilities, DpiInfo, WriteError};
 use openlogi_hook::Hook;
@@ -509,6 +509,17 @@ impl AppState {
             warn!(error = %e, "could not persist DPI presets to config.toml");
         }
         self.sync_dpi_cycle();
+    }
+
+    /// Update the global scroll settings and persist them through the live
+    /// in-memory config, so a later full-file `save_atomic` (device select,
+    /// DPI presets, app settings) can't revert them. Disk failures are logged,
+    /// not propagated — the panel shouldn't crash on a full volume.
+    pub fn commit_scroll_settings(&mut self, settings: ScrollSettings) {
+        self.config.set_scroll_settings(settings);
+        if let Err(e) = self.config.save_atomic() {
+            warn!(error = %e, "could not persist scroll settings");
+        }
     }
 
     /// Read the DPI preset list for the active device, or an empty `Vec`

@@ -33,6 +33,8 @@ fn live_cell() -> &'static Mutex<Option<Hook>> {
 pub fn set_live_hook(hook: Option<Hook>) {
     if let Ok(mut g) = live_cell().lock() {
         *g = hook;
+    } else {
+        warn!("LIVE_HOOK mutex poisoned — could not store hook handle");
     }
 }
 
@@ -44,10 +46,12 @@ pub fn live_hook_active() -> bool {
 /// Push scroll settings to the running hook, if any. Cheap and lock-free past
 /// the mutex; safe to call from the GPUI thread on every edit.
 pub fn push_scroll_settings(settings: openlogi_core::config::ScrollSettings) {
-    if let Ok(g) = live_cell().lock() {
-        if let Some(h) = g.as_ref() {
-            h.set_scroll_settings(settings);
-        }
+    let Ok(g) = live_cell().lock() else {
+        warn!("LIVE_HOOK mutex poisoned — could not push scroll settings");
+        return;
+    };
+    if let Some(h) = g.as_ref() {
+        h.set_scroll_settings(settings);
     }
 }
 
