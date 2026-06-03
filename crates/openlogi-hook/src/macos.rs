@@ -445,8 +445,8 @@ fn handle_scroll_event(
     driver.shared.push(
         if smooth_h { dx } else { 0.0 },
         if smooth_v { dy } else { 0.0 },
-        cfg.speed,
-        cfg.step,
+        cfg.vertical_speed,
+        cfg.vertical_step,
         pid,
         || {
             // This push armed a previously idle engine — start the frame clock.

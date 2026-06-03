@@ -129,46 +129,97 @@ fn default_true() -> bool {
 
 /// Global, software-side scroll behavior applied by the macOS event-tap
 /// engine in `openlogi-hook`. Defaults mirror Mos.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "these are independent user toggles, not a state machine"
 )]
 pub struct ScrollSettings {
     /// Master switch for software smoothing; `false` passes events through raw.
-    #[serde(default = "default_true")]
     pub smooth: bool,
     /// Invert the vertical scroll direction.
-    #[serde(default = "default_true")]
     pub reverse_vertical: bool,
     /// Invert the horizontal scroll direction.
-    #[serde(default = "default_true")]
     pub reverse_horizontal: bool,
     /// Apply smoothing to vertical scroll events.
-    #[serde(default = "default_true")]
     pub smooth_vertical: bool,
     /// Apply smoothing to horizontal scroll events.
-    #[serde(default = "default_true")]
     pub smooth_horizontal: bool,
-    /// Scroll speed multiplier.
-    #[serde(default = "default_scroll_speed")]
-    pub speed: f64,
-    /// Per-notch scroll step size, in pixels.
-    #[serde(default = "default_scroll_step")]
-    pub step: f64,
+    /// Vertical scroll speed multiplier.
+    pub vertical_speed: f64,
+    /// Horizontal scroll speed multiplier.
+    pub horizontal_speed: f64,
+    /// Vertical per-notch scroll step size, in pixels.
+    pub vertical_step: f64,
+    /// Horizontal per-notch scroll step size, in pixels.
+    pub horizontal_step: f64,
     /// Smoothing animation duration multiplier.
-    #[serde(default = "default_scroll_duration")]
     pub duration: f64,
     /// Minimum delta below which a scroll event is ignored.
-    #[serde(default = "default_scroll_dead_zone")]
     pub dead_zone: f64,
 }
 
-/// serde default for [`ScrollSettings::speed`]: mirrors Mos's default.
+#[derive(Debug, Deserialize)]
+struct ScrollSettingsWire {
+    #[serde(default = "default_true")]
+    smooth: bool,
+    #[serde(default = "default_true")]
+    reverse_vertical: bool,
+    #[serde(default = "default_true")]
+    reverse_horizontal: bool,
+    #[serde(default = "default_true")]
+    smooth_vertical: bool,
+    #[serde(default = "default_true")]
+    smooth_horizontal: bool,
+    #[serde(default)]
+    speed: Option<f64>,
+    #[serde(default)]
+    step: Option<f64>,
+    #[serde(default)]
+    vertical_speed: Option<f64>,
+    #[serde(default)]
+    horizontal_speed: Option<f64>,
+    #[serde(default)]
+    vertical_step: Option<f64>,
+    #[serde(default)]
+    horizontal_step: Option<f64>,
+    #[serde(default = "default_scroll_duration")]
+    duration: f64,
+    #[serde(default = "default_scroll_dead_zone")]
+    dead_zone: f64,
+}
+
+impl<'de> Deserialize<'de> for ScrollSettings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ScrollSettingsWire::deserialize(deserializer)?;
+        let speed = wire.speed.unwrap_or_else(default_scroll_speed);
+        let step = wire.step.unwrap_or_else(default_scroll_step);
+        Ok(Self {
+            smooth: wire.smooth,
+            reverse_vertical: wire.reverse_vertical,
+            reverse_horizontal: wire.reverse_horizontal,
+            smooth_vertical: wire.smooth_vertical,
+            smooth_horizontal: wire.smooth_horizontal,
+            vertical_speed: wire.vertical_speed.unwrap_or(speed),
+            horizontal_speed: wire.horizontal_speed.unwrap_or(speed),
+            vertical_step: wire.vertical_step.unwrap_or(step),
+            horizontal_step: wire.horizontal_step.unwrap_or(step),
+            duration: wire.duration,
+            dead_zone: wire.dead_zone,
+        })
+    }
+}
+
+/// serde default for [`ScrollSettings::vertical_speed`] and
+/// [`ScrollSettings::horizontal_speed`]: mirrors Mos's default.
 fn default_scroll_speed() -> f64 {
     2.70
 }
-/// serde default for [`ScrollSettings::step`]: mirrors Mos's default.
+/// serde default for [`ScrollSettings::vertical_step`] and
+/// [`ScrollSettings::horizontal_step`]: mirrors Mos's default.
 fn default_scroll_step() -> f64 {
     33.6
 }
@@ -189,8 +240,10 @@ impl Default for ScrollSettings {
             reverse_horizontal: true,
             smooth_vertical: true,
             smooth_horizontal: true,
-            speed: default_scroll_speed(),
-            step: default_scroll_step(),
+            vertical_speed: default_scroll_speed(),
+            horizontal_speed: default_scroll_speed(),
+            vertical_step: default_scroll_step(),
+            horizontal_step: default_scroll_step(),
             duration: default_scroll_duration(),
             dead_zone: default_scroll_dead_zone(),
         }
@@ -524,26 +577,31 @@ mod tests {
     }
 
     #[test]
-    fn scroll_settings_default_matches_mos() {
+    fn scroll_settings_default_matches_mos_per_axis() {
         let s = ScrollSettings::default();
         assert!(s.smooth);
         assert!(s.reverse_vertical);
         assert!(s.reverse_horizontal);
         assert!(s.smooth_vertical);
         assert!(s.smooth_horizontal);
-        assert!((s.speed - 2.70).abs() < f64::EPSILON);
-        assert!((s.step - 33.6).abs() < f64::EPSILON);
+        assert!((s.vertical_speed - 2.70).abs() < f64::EPSILON);
+        assert!((s.horizontal_speed - 2.70).abs() < f64::EPSILON);
+        assert!((s.vertical_step - 33.6).abs() < f64::EPSILON);
+        assert!((s.horizontal_step - 33.6).abs() < f64::EPSILON);
         assert!((s.duration - 4.35).abs() < f64::EPSILON);
         assert!((s.dead_zone - 1.00).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn scroll_settings_roundtrip() {
+    fn scroll_settings_roundtrip_per_axis() {
         let mut cfg = Config::default();
         let s = ScrollSettings {
             smooth: false,
             reverse_horizontal: false,
-            speed: 5.0,
+            vertical_speed: 4.0,
+            horizontal_speed: 6.0,
+            vertical_step: 20.0,
+            horizontal_step: 44.0,
             ..ScrollSettings::default()
         };
         cfg.set_scroll_settings(s.clone());
@@ -551,8 +609,34 @@ mod tests {
         let got = parsed.scroll_settings();
         assert!(!got.smooth);
         assert!(!got.reverse_horizontal);
-        assert!((got.speed - 5.0).abs() < f64::EPSILON);
+        assert!((got.vertical_speed - 4.0).abs() < f64::EPSILON);
+        assert!((got.horizontal_speed - 6.0).abs() < f64::EPSILON);
+        assert!((got.vertical_step - 20.0).abs() < f64::EPSILON);
+        assert!((got.horizontal_step - 44.0).abs() < f64::EPSILON);
         assert!(got.reverse_vertical);
+    }
+
+    #[test]
+    fn old_scroll_speed_and_step_load_into_both_axes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"schema_version = 1
+
+[app_settings.scroll]
+speed = 5.5
+step = 12.5
+"#,
+        )
+        .expect("write");
+
+        let cfg = Config::load_from_path(&path).expect("load");
+        let got = cfg.scroll_settings();
+        assert!((got.vertical_speed - 5.5).abs() < f64::EPSILON);
+        assert!((got.horizontal_speed - 5.5).abs() < f64::EPSILON);
+        assert!((got.vertical_step - 12.5).abs() < f64::EPSILON);
+        assert!((got.horizontal_step - 12.5).abs() < f64::EPSILON);
     }
 
     #[test]

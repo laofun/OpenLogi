@@ -49,14 +49,14 @@ impl ScrollPanel {
                 .max(10.0)
                 .min(1.0)
                 .step(0.1)
-                .default_value(f64_to_f32(settings.speed))
+                .default_value(f64_to_f32(settings.vertical_speed))
         });
         let step = cx.new(|_| {
             SliderState::new()
                 .max(100.0)
                 .min(0.01)
                 .step(0.5)
-                .default_value(f64_to_f32(settings.step))
+                .default_value(f64_to_f32(settings.vertical_step))
         });
         let duration = cx.new(|_| {
             SliderState::new()
@@ -79,7 +79,7 @@ impl ScrollPanel {
         subs.push(
             cx.subscribe(&speed, |this, _slider, event: &SliderEvent, cx| {
                 if let SliderEvent::Release(v) = event {
-                    this.settings.speed = f64::from(v.start());
+                    this.settings.vertical_speed = f64::from(v.start());
                     this.on_change(cx);
                     cx.notify();
                 }
@@ -88,7 +88,7 @@ impl ScrollPanel {
         subs.push(
             cx.subscribe(&step, |this, _slider, event: &SliderEvent, cx| {
                 if let SliderEvent::Release(v) = event {
-                    this.settings.step = f64::from(v.start());
+                    this.settings.vertical_step = f64::from(v.start());
                     this.on_change(cx);
                     cx.notify();
                 }
@@ -145,8 +145,8 @@ impl ScrollPanel {
         // all four `update` calls can use it). Read the values before the move so
         // the slider borrows don't alias `self.settings`.
         let thumbs = [
-            (&self.speed, defaults.speed),
-            (&self.step, defaults.step),
+            (&self.speed, defaults.vertical_speed),
+            (&self.step, defaults.vertical_step),
             (&self.duration, defaults.duration),
             (&self.dead_zone, defaults.dead_zone),
         ];
@@ -232,8 +232,8 @@ impl Render for ScrollPanel {
                 cx,
             ))
             // Sliders
-            .child(slider_row(tr!("Speed"), self.settings.speed, &self.speed, pal))
-            .child(slider_row(tr!("Step"), self.settings.step, &self.step, pal))
+            .child(slider_row(tr!("Speed"), self.settings.vertical_speed, &self.speed, pal))
+            .child(slider_row(tr!("Step"), self.settings.vertical_step, &self.step, pal))
             .child(slider_row(
                 tr!("Duration"),
                 self.settings.duration,
