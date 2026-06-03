@@ -955,13 +955,137 @@ fn smartshift_pending(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, reason = "expect/unwrap are idiomatic in tests")]
 mod tests {
     use super::*;
     use openlogi_core::config::Config;
+    use openlogi_core::device::{
+        DeviceInventory, DeviceKind, DeviceModelInfo, DeviceTransports, PairedDevice, ReceiverInfo,
+    };
+    use openlogi_hid::DIRECT_DEVICE_INDEX;
     use std::collections::HashSet;
 
     fn keys(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Minimal BLE-direct inventory for an MX Master 2S (046d:b019), the device
+    /// upstream does not support. Mirrors what `inventory::enumerate` produces
+    /// for a directly-attached mouse: `receiver.unique_id = None` and the device
+    /// pinned at [`DIRECT_DEVICE_INDEX`], so [`build_device_list`] resolves a
+    /// single `DeviceRoute::Direct` record at index 0. `config_key` is `"0b019"`.
+    fn mx_master_2s_inventory() -> DeviceInventory {
+        DeviceInventory {
+            receiver: ReceiverInfo {
+                name: "MX Master 2S".to_string(),
+                vendor_id: 0x046d,
+                product_id: 0xb019,
+                unique_id: None,
+            },
+            paired: vec![PairedDevice {
+                slot: DIRECT_DEVICE_INDEX,
+                codename: Some("MX Master 2S".to_string()),
+                wpid: Some(0xb019),
+                kind: DeviceKind::Mouse,
+                online: true,
+                battery: None,
+                model_info: Some(DeviceModelInfo {
+                    entity_count: 0,
+                    serial_number: None,
+                    unit_id: [0; 4],
+                    transports: DeviceTransports::default(),
+                    model_ids: [0xb019, 0, 0],
+                    extended_model_id: 0,
+                }),
+            }],
+        }
+    }
+
+    /// Build an `AppState` holding exactly the MX Master 2S as its active device,
+    /// and return it alongside that device's `config_key` and `DeviceRoute`.
+    fn mx_master_2s_state() -> (AppState, String, DeviceRoute) {
+        let inv = mx_master_2s_inventory();
+        let state = AppState::with_runtime(Config::default(), &[inv], &AssetResolver::new());
+        let record = state
+            .current_record()
+            .expect("MX Master 2S must be the active device");
+        let key = record.config_key.clone();
+        let route = record
+            .route
+            .clone()
+            .expect("direct device must have a route");
+        (state, key, route)
+    }
+
+    /// Regression test for the GUI "Unsupported" DPI bug (fix 1073adb): a single
+    /// transient `FeatureUnsupported{0x2201}` from the shared BLE channel must
+    /// never permanently wedge the MX Master 2S — which genuinely supports
+    /// AdjustableDpi — on the terminal [`DpiStatus::Unsupported`]. Every error
+    /// flows through the retry budget and settles on the retryable
+    /// [`DpiStatus::Failed`].
+    #[test]
+    fn dpi_feature_unsupported_settles_on_failed_never_unsupported() {
+        let (mut state, key, route) = mx_master_2s_state();
+        let err = || WriteError::FeatureUnsupported {
+            feature_hex: 0x2201,
+        };
+
+        // Before the budget is exhausted the status is cleared back to Unknown
+        // so the next render re-probes — and is never Unsupported.
+        for attempt in 1..DPI_LOAD_MAX_ATTEMPTS {
+            state.store_dpi_info(key.clone(), &route, Err(err()));
+            assert!(
+                matches!(state.current_dpi_status(), DpiStatus::Unknown),
+                "attempt {attempt}: expected Unknown (re-probe), got {:?}",
+                state.current_dpi_status()
+            );
+            assert!(
+                !matches!(state.current_dpi_status(), DpiStatus::Unsupported(_)),
+                "attempt {attempt}: must never be Unsupported",
+            );
+        }
+
+        // The budget-exhausting attempt settles on the retryable Failed, never
+        // the terminal Unsupported.
+        state.store_dpi_info(key.clone(), &route, Err(err()));
+        assert!(
+            matches!(state.current_dpi_status(), DpiStatus::Failed(_)),
+            "exhausted budget must settle on Failed, got {:?}",
+            state.current_dpi_status()
+        );
+        assert!(
+            !matches!(state.current_dpi_status(), DpiStatus::Unsupported(_)),
+            "exhausted budget must never be Unsupported",
+        );
+    }
+
+    /// A successful read after transient failures must clear the attempt budget
+    /// and present the device's real DPI capabilities — i.e. the retry path
+    /// recovers rather than staying stuck.
+    #[test]
+    fn dpi_recovers_to_ready_after_transient_failures() {
+        let (mut state, key, route) = mx_master_2s_state();
+        let err = || WriteError::FeatureUnsupported {
+            feature_hex: 0x2201,
+        };
+
+        // Two transient misses (below the budget) leave the device re-probing.
+        state.store_dpi_info(key.clone(), &route, Err(err()));
+        state.store_dpi_info(key.clone(), &route, Err(err()));
+        assert!(matches!(state.current_dpi_status(), DpiStatus::Unknown));
+
+        // A real read lands: the device reports its capabilities and goes Ready.
+        let caps = DpiCapabilities::new(vec![200, 1000, 4000]).expect("non-empty DPI list");
+        let info = DpiInfo {
+            current: 1000,
+            capabilities: caps,
+        };
+        state.store_dpi_info(key.clone(), &route, Ok(info));
+        assert!(
+            matches!(state.current_dpi_status(), DpiStatus::Ready(_)),
+            "a successful read must present DPI as Ready, got {:?}",
+            state.current_dpi_status()
+        );
     }
 
     #[test]
