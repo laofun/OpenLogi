@@ -1,6 +1,5 @@
 //! macOS `CGEventTap` implementation of the OS-level mouse hook.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
@@ -265,14 +264,15 @@ struct ScrollDriver {
     shared: Arc<SharedSmooth>,
     scroll: Arc<ArcSwap<ScrollSettings>>,
     link: CVDisplayLinkRef,
-    running: AtomicBool,
 }
 
 // SAFETY: CVDisplayLinkRef is a CoreVideo object pointer; CoreVideo permits
 // start/stop from any thread. The Arc fields are Send+Sync.
 unsafe impl Send for ScrollDriver {}
-// SAFETY: see the Send impl; all mutable cross-thread state lives in the
-// AtomicBool / Arc fields, so shared access from multiple threads is sound.
+// SAFETY: see the Send impl. The run-flag now lives inside `SharedSmooth`
+// (Mutex-guarded, accessed via Arc); the remaining fields are `Arc` (Sync) and
+// the `link` raw pointer, which is only read (copied) after construction, so
+// shared access from multiple threads is sound.
 unsafe impl Sync for ScrollDriver {}
 
 extern "C" fn display_link_cb(
@@ -292,8 +292,10 @@ extern "C" fn display_link_cb(
     let dead_zone = cfg.dead_zone.max(MIN_DEAD_ZONE); // floor: guarantees convergence
     if let Some((dx, dy, pid)) = driver.shared.frame(transition, dead_zone) {
         post_synthetic_scroll(dx, dy, pid);
-    } else {
-        driver.running.store(false, Ordering::Release);
+    } else if !driver.shared.rearm_if_pending() {
+        // Genuinely idle — park the link until the next push restarts it. If a
+        // push raced in during parking, rearm_if_pending() returned true and we
+        // keep firing so the next callback drains the new delta.
         // SAFETY: valid link ref; CVDisplayLinkStop is thread-safe.
         unsafe { CVDisplayLinkStop(driver.link) };
     }
@@ -363,8 +365,8 @@ pub(crate) fn start(
 ///
 /// The driver is reached both from the leaked reference captured in the tap
 /// closure and from the raw `*const` handed to the C callback, so access is
-/// shared (`&'static`, not `&mut`) — all mutable cross-thread state lives in
-/// the `AtomicBool` / `Arc` fields.
+/// shared (`&'static`, not `&mut`) — all mutable cross-thread state lives behind
+/// the `Arc<SharedSmooth>` mutex.
 fn build_scroll_driver(scroll: Arc<ArcSwap<ScrollSettings>>) -> &'static ScrollDriver {
     let mut link: CVDisplayLinkRef = std::ptr::null_mut();
     // SAFETY: out-pointer receives a fresh link; we configure the callback +
@@ -378,7 +380,6 @@ fn build_scroll_driver(scroll: Arc<ArcSwap<ScrollSettings>>) -> &'static ScrollD
         shared: Arc::new(SharedSmooth::new()),
         scroll,
         link,
-        running: AtomicBool::new(false),
     }));
     // SAFETY: callback receives the leaked driver pointer; user_info outlives
     // the link because the driver is never freed.
@@ -425,14 +426,14 @@ fn handle_scroll_event(
     }
     #[allow(clippy::cast_possible_truncation, reason = "PID fits in i32")]
     let pid = event.get_integer_value_field(EventField::EVENT_TARGET_UNIX_PROCESS_ID) as i32;
-    driver.shared.push(
+    if driver.shared.push(
         if smooth_h { dx } else { 0.0 },
         if smooth_v { dy } else { 0.0 },
         cfg.speed,
         cfg.step,
         pid,
-    );
-    if !driver.running.swap(true, Ordering::AcqRel) {
+    ) {
+        // This push armed a previously idle engine — start the frame clock.
         // SAFETY: link created in build_scroll_driver; safe to start from any thread.
         unsafe { CVDisplayLinkStart(driver.link) };
     }

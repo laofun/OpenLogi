@@ -101,13 +101,23 @@ use std::sync::Mutex;
 /// to this minimum.
 pub const MIN_DEAD_ZONE: f64 = 0.1;
 
-/// Shared smoothing state plus the captured target PID. The tap thread writes
-/// (`push`); the display-link thread drains (`frame`).
+/// Engine plus the run-flag and target PID, all guarded by one lock so the
+/// buffer state and "is the display link running" flag flip atomically.
+#[derive(Debug, Default)]
+struct EngineState {
+    engine: SmoothEngine,
+    /// Whether the display link is currently driving this engine.
+    running: bool,
+    /// PID of the app the original scroll targeted, captured on the last input.
+    target_pid: i32,
+}
+
+/// Shared smoothing state. The tap thread calls [`Self::push`]; the display-link
+/// thread calls [`Self::frame`] / [`Self::rearm_if_pending`]. All state lives
+/// under a single mutex so a push that races a park cannot lose its wakeup.
 #[derive(Debug, Default)]
 pub struct SharedSmooth {
-    engine: Mutex<SmoothEngine>,
-    /// PID of the app the original scroll targeted, captured on the last input.
-    target_pid: std::sync::atomic::AtomicI32,
+    state: Mutex<EngineState>,
 }
 
 impl SharedSmooth {
@@ -116,22 +126,52 @@ impl SharedSmooth {
         Self::default()
     }
 
-    /// Add an input tick and remember its target PID.
-    pub fn push(&self, dx: f64, dy: f64, speed: f64, step: f64, pid: i32) {
-        self.target_pid
-            .store(pid, std::sync::atomic::Ordering::Relaxed);
-        if let Ok(mut e) = self.engine.lock() {
-            e.add(dx, dy, speed, step);
+    /// Add an input tick (already inverted) and remember its target PID.
+    /// Returns `true` when the caller must start the display link — i.e. this
+    /// push armed a previously idle engine. The run-flag flips under the same
+    /// lock as the buffer, so a concurrent [`Self::frame`] parking the link
+    /// cannot lose this wakeup.
+    pub fn push(&self, dx: f64, dy: f64, speed: f64, step: f64, pid: i32) -> bool {
+        let Ok(mut st) = self.state.lock() else {
+            return false;
+        };
+        st.target_pid = pid;
+        st.engine.add(dx, dy, speed, step);
+        if st.running {
+            false
+        } else {
+            st.running = true;
+            true
         }
     }
 
-    /// Compute the next frame. Returns `(dx, dy, pid)` to post, or `None` when
-    /// settled (caller should stop the display link).
+    /// Advance one frame. `Some((dx, dy, pid))` to post, or `None` when the run
+    /// has settled. On `None`, clears the run-flag under the lock; the caller
+    /// must then call [`Self::rearm_if_pending`] before stopping the link.
     pub fn frame(&self, transition: f64, dead_zone: f64) -> Option<(f64, f64, i32)> {
-        let mut e = self.engine.lock().ok()?;
-        let (dx, dy) = e.advance(transition, dead_zone)?;
-        let pid = self.target_pid.load(std::sync::atomic::Ordering::Relaxed);
-        Some((dx, dy, pid))
+        let mut st = self.state.lock().ok()?;
+        if let Some((dx, dy)) = st.engine.advance(transition, dead_zone) {
+            Some((dx, dy, st.target_pid))
+        } else {
+            st.running = false;
+            None
+        }
+    }
+
+    /// After [`Self::frame`] returned `None`, re-check whether a concurrent
+    /// [`Self::push`] re-armed the engine during parking. Returns `true` (and
+    /// re-sets the run-flag) when there is fresh work, so the caller keeps the
+    /// link running instead of stopping it; `false` when genuinely idle.
+    pub fn rearm_if_pending(&self) -> bool {
+        let Ok(mut st) = self.state.lock() else {
+            return false;
+        };
+        if st.engine.is_idle() {
+            false
+        } else {
+            st.running = true;
+            true
+        }
     }
 }
 
@@ -199,12 +239,29 @@ mod tests {
     #[test]
     fn shared_smooth_drains_to_none() {
         let s = SharedSmooth::new();
-        s.push(0.0, 10.0, 1.0, 0.0, 1234);
+        assert!(s.push(0.0, 10.0, 1.0, 0.0, 1234)); // idle → caller starts link
         let mut got = 0.0;
         while let Some((_, dy, pid)) = s.frame(0.5, 0.5) {
             assert_eq!(pid, 1234);
             got += dy;
         }
         assert!(got > 8.0);
+    }
+
+    #[test]
+    fn push_signals_start_only_when_idle() {
+        let s = SharedSmooth::new();
+        assert!(s.push(0.0, 10.0, 1.0, 0.0, 1)); // was idle → start
+        assert!(!s.push(0.0, 10.0, 1.0, 0.0, 1)); // already running → no start
+    }
+
+    #[test]
+    fn rearm_detects_a_raced_push() {
+        let s = SharedSmooth::new();
+        assert!(s.push(0.0, 10.0, 1.0, 0.0, 1));
+        while s.frame(0.5, 0.5).is_some() {} // drain → frame cleared running
+        assert!(!s.rearm_if_pending()); // genuinely idle
+        assert!(s.push(0.0, 10.0, 1.0, 0.0, 1)); // fresh work arrives
+        assert!(s.rearm_if_pending()); // re-armed
     }
 }
