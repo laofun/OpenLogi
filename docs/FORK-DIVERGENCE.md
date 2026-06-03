@@ -112,7 +112,7 @@ few shared files upstream owns — recorded here so a future merge re-applies th
 
 | File | Fork change | Conflict risk |
 |---|---|---|
-| `crates/openlogi-hook/src/macos.rs` | The tap intercepts **all** `ScrollWheel` events into `handle_scroll_event` (invert → feed the `CVDisplayLink` smooth engine → post synthetic frames via `CGEventPostToPid`) and returns *before* the user callback. New CVDisplayLink/CGEvent FFI. | **Medium** — large additive block in the tap callback + new FFI; upstream may touch this file. |
+| `crates/openlogi-hook/src/macos.rs` | The tap intercepts **all** `ScrollWheel` events into `handle_scroll_event` (invert → feed the `CVDisplayLink` smooth engine → post synthetic frames at the HID tap location) and returns *before* the user callback. New CVDisplayLink/CGEvent glue. | **Medium** — large additive block in the tap callback + new FFI; upstream may touch this file. |
 | `crates/openlogi-hook/src/lib.rs` | `Hook` holds `Arc<ArcSwap<ScrollSettings>>`; `set_scroll_settings`; `pub use scroll::MIN_DEAD_ZONE`; `mod scroll`. | **Low** — additive. |
 | `crates/openlogi-core/src/config.rs` | Global `ScrollSettings` under `AppSettings.scroll` + accessors (serde-skipped when default). | **Low** — additive (file also in §2). |
 | `crates/openlogi-gui/src/main.rs` | Hook ownership moved into `hook_runtime` so live scroll settings can be pushed on edit; startup pushes persisted settings. | **Medium** — upstream owns `main.rs` wiring. |

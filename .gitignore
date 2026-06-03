@@ -25,6 +25,9 @@ devenv.local.yaml
 # Claude Code worktree + transcripts — per-developer state.
 /.claude/
 
+# Superpowers visual brainstorming sessions — local per-developer state.
+/.superpowers/
+
 # macOS finder metadata
 .DS_Store
 

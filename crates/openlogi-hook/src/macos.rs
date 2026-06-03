@@ -44,11 +44,6 @@ unsafe extern "C" {
     fn CVDisplayLinkStop(link: CVDisplayLinkRef) -> CVReturn;
 }
 
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGEventPostToPid(pid: i32, event: core_foundation::base::CFTypeRef);
-}
-
 /// Marker stamped on our synthetic events (`eventSourceUserData`) so the tap skips them.
 const SYNTHETIC_MARKER: i64 = 0x4F4C_4753; // "OLGS"
 
@@ -305,16 +300,18 @@ extern "C" fn display_link_cb(
         // from within the link's own callback, returns without waiting.
         unsafe { CVDisplayLinkStop(driver.link) };
     });
-    if let Some((dx, dy, pid)) = frame {
-        post_synthetic_scroll(dx, dy, pid);
+    if let Some((dx, dy, _pid)) = frame {
+        post_synthetic_scroll(dx, dy);
     }
     0 // kCVReturnSuccess
 }
 
-/// Build one continuous (pixel) synthetic scroll event, tag it, post to `pid`.
-fn post_synthetic_scroll(dx: f64, dy: f64, pid: i32) {
-    use foreign_types::ForeignType as _;
-
+/// Build one continuous (pixel) synthetic scroll event, tag it, and post it at
+/// the HID location. Posting to the HID stream (rather than to the original
+/// target PID) matches the working action-dispatch scroll path and lets macOS
+/// route the event normally; the marker keeps our tap from feeding the synthetic
+/// frame back into the smoothing engine.
+fn post_synthetic_scroll(dx: f64, dy: f64) {
     let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
         return;
     };
@@ -326,14 +323,12 @@ fn post_synthetic_scroll(dx: f64, dy: f64, pid: i32) {
     let (wheel1, wheel2) = (dy.round() as i32, dx.round() as i32);
     let Ok(event) = CGEvent::new_scroll_event(source, ScrollEventUnit::PIXEL, 2, wheel1, wheel2, 0)
     else {
+        debug!("smooth-scroll synthetic event creation failed");
         return;
     };
     event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER);
     event.set_double_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1.0);
-    // SAFETY: `event` is a live CGEventRef for the call; CGEventPostToPid copies
-    // what it needs. `as_ptr()` yields the raw event pointer (CGEvent uses
-    // foreign_types, not TCFType); we cast it to the `CFTypeRef` the C ABI wants.
-    unsafe { CGEventPostToPid(pid, event.as_ptr().cast()) };
+    event.post(CGEventTapLocation::HID);
 }
 
 /// Create the event tap and run loop on a dedicated thread.
@@ -443,8 +438,8 @@ fn handle_scroll_event(
     #[allow(clippy::cast_possible_truncation, reason = "PID fits in i32")]
     let pid = event.get_integer_value_field(EventField::EVENT_TARGET_UNIX_PROCESS_ID) as i32;
     if pid <= 0 {
-        // No specific target process: CGEventPostToPid(0, ..) is a no-op, so we
-        // must not Drop the original — pass it through unsmoothed instead.
+        // No specific target process: keep the original event rather than risk
+        // swallowing a wheel tick we cannot safely associate with a user action.
         return CallbackResult::Keep;
     }
     driver.shared.push(
