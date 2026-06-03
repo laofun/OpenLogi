@@ -105,6 +105,15 @@ The non-obvious traps. Details and code references in
   instead of posting it.
 - **The hook callback runs on a background thread**, not the GPUI thread, and
   must return quickly — blocking it stalls system-wide input.
+- **Scroll-wheel events never reach the hook callback.** The macOS tap routes
+  every `ScrollWheel` into `handle_scroll_event` (per-axis inversion + Mos-style
+  smoothing) and returns *before* invoking `cb`, so `MouseEvent::Scroll` is never
+  delivered — wheel input is consumed by inversion/smoothing, not dispatchable as
+  an action. When smoothing an axis the tap swallows the original event (`Drop`)
+  and re-emits interpolated frames via `CGEventPostToPid` on the CVDisplayLink
+  thread; those carry a synthetic marker so the tap skips its own output. See
+  `openlogi-hook/src/macos.rs` + `scroll.rs`, and
+  [`docs/FORK-DIVERGENCE.md`](docs/FORK-DIVERGENCE.md) §4.
 
 ## 6. Stability contracts
 

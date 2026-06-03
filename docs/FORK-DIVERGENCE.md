@@ -3,7 +3,9 @@
 This fork adds support for the **Logitech MX Master 2S** (`046d:b019`), a device
 upstream does not support. Upstream targets the MX Master 3 / 3S generation,
 which exposes a newer set of HID++ features; the 2S uses the older equivalents.
-Every divergence below exists to bridge that gap.
+Most divergences below exist to bridge that gap. The fork also carries a second,
+unrelated feature area — **software wheel-scroll settings** (per-axis inversion +
+Mos-style smoothing, all in the macOS event tap, no HID++); see §4.
 
 This document is the map for **future upstream merges**: it records *what* the
 fork changed, *why*, and a **post-merge checklist** ending in a hardware test on
@@ -92,18 +94,53 @@ fork-critical behavior — do not "fix" the test without understanding why.
 
 ---
 
-## 4. Post-merge checklist
+## 4. Wheel scroll settings (fork-local, unrelated to the 2S)
+
+A second fork-only feature: software scroll-direction inversion + Mos-style
+smooth scrolling, implemented entirely in the macOS event tap (no HID++). Like
+the 2S work it is mostly **quarantined into new files**, but it also modifies a
+few shared files upstream owns — recorded here so a future merge re-applies them.
+
+### Fork-only modules (additive — never conflict)
+
+| File | Responsibility |
+|---|---|
+| `crates/openlogi-hook/src/scroll.rs` | FFI-free smooth-scroll math + `SharedSmooth` engine state (`lerp`/`normalize`/`SmoothEngine`, trackpad detection, `MIN_DEAD_ZONE`, the lock-coupled `push`/`frame_or_stop` start/stop protocol). |
+| `crates/openlogi-gui/src/components/scroll_panel.rs` | GUI panel (invert toggles + speed/step/duration/dead-zone sliders), modeled on the DPI panel; pushes edits live and persists them. |
+
+### Shared files the fork modifies (can conflict on a merge)
+
+| File | Fork change | Conflict risk |
+|---|---|---|
+| `crates/openlogi-hook/src/macos.rs` | The tap intercepts **all** `ScrollWheel` events into `handle_scroll_event` (invert → feed the `CVDisplayLink` smooth engine → post synthetic frames via `CGEventPostToPid`) and returns *before* the user callback. New CVDisplayLink/CGEvent FFI. | **Medium** — large additive block in the tap callback + new FFI; upstream may touch this file. |
+| `crates/openlogi-hook/src/lib.rs` | `Hook` holds `Arc<ArcSwap<ScrollSettings>>`; `set_scroll_settings`; `pub use scroll::MIN_DEAD_ZONE`; `mod scroll`. | **Low** — additive. |
+| `crates/openlogi-core/src/config.rs` | Global `ScrollSettings` under `AppSettings.scroll` + accessors (serde-skipped when default). | **Low** — additive (file also in §2). |
+| `crates/openlogi-gui/src/main.rs` | Hook ownership moved into `hook_runtime` so live scroll settings can be pushed on edit; startup pushes persisted settings. | **Medium** — upstream owns `main.rs` wiring. |
+| `crates/openlogi-gui/src/hook_runtime.rs` | Global live-hook handle + `push_scroll_settings`. | **Low** — additive. |
+| `crates/openlogi-gui/src/state.rs` | `commit_scroll_settings` (persists through the long-lived `AppState` config to avoid clobber). | **Low** — additive (file also in §2). |
+| `crates/openlogi-gui/src/app.rs`, `components/mod.rs` | Mount the scroll panel. | **Low** — additive. |
+
+**Non-obvious:** because the tap returns inside `handle_scroll_event`,
+`MouseEvent::Scroll` is **never** delivered to `Hook::start`'s callback — wheel
+events are consumed by inversion/smoothing, not dispatched as actions. Also noted
+in [`CLAUDE.md`](../CLAUDE.md#5-critical-gotchas).
+
+---
+
+## 5. Post-merge checklist
 
 Run this **in order** after merging `upstream/master`. Do not skip the hardware
 test — the automated gate cannot exercise real HID++ traffic.
 
-1. **Resolve conflicts** — expect them only in `write.rs` (SmartShift reroute)
-   and `state.rs` (GUI DPI-`Failed` policy). Re-apply the fork behavior from
-   §2; the rest should auto-merge.
+1. **Resolve conflicts** — for the 2S work expect them in `write.rs` (SmartShift
+   reroute) and `state.rs` (GUI DPI-`Failed` policy); for the wheel-scroll work
+   (§4) possibly `macos.rs` (tap scroll engine) and `main.rs` (GUI hook
+   ownership). Re-apply the fork behavior from §2 and §4; the rest should
+   auto-merge.
 2. **Update the recorded merge point** in §0 of this file to the new
    `upstream/master` tip.
 3. **Re-scan divergence** — `git diff --stat <new-merge-point> HEAD -- crates/`
-   and update §2's tables if upstream moved fork-touched code.
+   and update the §2 and §4 tables if upstream moved fork-touched code.
 4. **Run the full gate** (do **not** unset `DEVELOPER_DIR` — full Xcode is
    required for GUI builds):
    ```sh
