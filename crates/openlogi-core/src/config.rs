@@ -55,7 +55,7 @@ impl Default for Config {
 ///
 /// All fields are `#[serde(default)]` so adding a new one is backward
 /// compatible — old config files just keep the default for the new field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent on/off user preferences, not a state machine"
@@ -94,6 +94,9 @@ pub struct AppSettings {
     /// regardless of the OS setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Global software-side scroll behavior (invert + smooth). See [`ScrollSettings`].
+    #[serde(default, skip_serializing_if = "ScrollSettings::is_default")]
+    pub scroll: ScrollSettings,
 }
 
 impl AppSettings {
@@ -113,6 +116,7 @@ impl Default for AppSettings {
             update_prompt_seen: false,
             show_in_menu_bar: true,
             language: None,
+            scroll: ScrollSettings::default(),
         }
     }
 }
@@ -121,6 +125,85 @@ impl Default for AppSettings {
 /// icon is on out of the box and configs predating the field keep that behavior.
 fn default_true() -> bool {
     true
+}
+
+/// Global, software-side scroll behavior applied by the macOS event-tap
+/// engine in `openlogi-hook`. Defaults mirror Mos.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "these are independent user toggles, not a state machine"
+)]
+pub struct ScrollSettings {
+    /// Master switch for software smoothing; `false` passes events through raw.
+    #[serde(default = "default_true")]
+    pub smooth: bool,
+    /// Invert the vertical scroll direction.
+    #[serde(default = "default_true")]
+    pub reverse_vertical: bool,
+    /// Invert the horizontal scroll direction.
+    #[serde(default = "default_true")]
+    pub reverse_horizontal: bool,
+    /// Apply smoothing to vertical scroll events.
+    #[serde(default = "default_true")]
+    pub smooth_vertical: bool,
+    /// Apply smoothing to horizontal scroll events.
+    #[serde(default = "default_true")]
+    pub smooth_horizontal: bool,
+    /// Scroll speed multiplier.
+    #[serde(default = "default_scroll_speed")]
+    pub speed: f64,
+    /// Per-notch scroll step size, in pixels.
+    #[serde(default = "default_scroll_step")]
+    pub step: f64,
+    /// Smoothing animation duration multiplier.
+    #[serde(default = "default_scroll_duration")]
+    pub duration: f64,
+    /// Minimum delta below which a scroll event is ignored.
+    #[serde(default = "default_scroll_dead_zone")]
+    pub dead_zone: f64,
+}
+
+/// serde default for [`ScrollSettings::speed`]: mirrors Mos's default.
+fn default_scroll_speed() -> f64 {
+    2.70
+}
+/// serde default for [`ScrollSettings::step`]: mirrors Mos's default.
+fn default_scroll_step() -> f64 {
+    33.6
+}
+/// serde default for [`ScrollSettings::duration`]: mirrors Mos's default.
+fn default_scroll_duration() -> f64 {
+    4.35
+}
+/// serde default for [`ScrollSettings::dead_zone`]: mirrors Mos's default.
+fn default_scroll_dead_zone() -> f64 {
+    1.00
+}
+
+impl Default for ScrollSettings {
+    fn default() -> Self {
+        Self {
+            smooth: true,
+            reverse_vertical: true,
+            reverse_horizontal: true,
+            smooth_vertical: true,
+            smooth_horizontal: true,
+            speed: default_scroll_speed(),
+            step: default_scroll_step(),
+            duration: default_scroll_duration(),
+            dead_zone: default_scroll_dead_zone(),
+        }
+    }
+}
+
+impl ScrollSettings {
+    /// `skip_serializing_if` helper: true when nothing diverges from the
+    /// default, so an untouched scroll section is omitted from `config.toml`.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// Settings scoped to a single physical device (keyed by HID++ model+ext).
@@ -335,6 +418,17 @@ impl Config {
         }
     }
 
+    /// The global scroll settings (invert + smooth).
+    #[must_use]
+    pub fn scroll_settings(&self) -> ScrollSettings {
+        self.app_settings.scroll.clone()
+    }
+
+    /// Replace the global scroll settings.
+    pub fn set_scroll_settings(&mut self, settings: ScrollSettings) {
+        self.app_settings.scroll = settings;
+    }
+
     /// HID++ config key of the carousel-selected device, if any.
     #[must_use]
     pub fn selected_device(&self) -> Option<&str> {
@@ -427,6 +521,47 @@ mod tests {
         let path = dir.path().join("config.toml");
         config.save_to_path(&path).expect("save");
         Config::load_from_path(&path).expect("load")
+    }
+
+    #[test]
+    fn scroll_settings_default_matches_mos() {
+        let s = ScrollSettings::default();
+        assert!(s.smooth);
+        assert!(s.reverse_vertical);
+        assert!(s.reverse_horizontal);
+        assert!(s.smooth_vertical);
+        assert!(s.smooth_horizontal);
+        assert!((s.speed - 2.70).abs() < f64::EPSILON);
+        assert!((s.step - 33.6).abs() < f64::EPSILON);
+        assert!((s.duration - 4.35).abs() < f64::EPSILON);
+        assert!((s.dead_zone - 1.00).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn scroll_settings_roundtrip() {
+        let mut cfg = Config::default();
+        let s = ScrollSettings {
+            smooth: false,
+            reverse_horizontal: false,
+            speed: 5.0,
+            ..ScrollSettings::default()
+        };
+        cfg.set_scroll_settings(s.clone());
+        let parsed = write_and_read(&cfg);
+        let got = parsed.scroll_settings();
+        assert!(!got.smooth);
+        assert!(!got.reverse_horizontal);
+        assert!((got.speed - 5.0).abs() < f64::EPSILON);
+        assert!(got.reverse_vertical);
+    }
+
+    #[test]
+    fn config_without_scroll_section_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "schema_version = 1\n").expect("write");
+        let cfg = Config::load_from_path(&path).expect("load");
+        assert_eq!(cfg.scroll_settings(), ScrollSettings::default());
     }
 
     #[test]
