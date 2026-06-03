@@ -52,6 +52,13 @@ unsafe extern "C" {
 /// Marker stamped on our synthetic events (`eventSourceUserData`) so the tap skips them.
 const SYNTHETIC_MARKER: i64 = 0x4F4C_4753; // "OLGS"
 
+/// `kCGScrollWheelEventScrollPhase` — non-zero on trackpad / continuous scrolls.
+const FIELD_SCROLL_PHASE: core_graphics::event::CGEventField = 99;
+/// `kCGScrollWheelEventMomentumPhase` — non-zero during momentum (inertial) scrolls.
+const FIELD_MOMENTUM_PHASE: core_graphics::event::CGEventField = 123;
+/// `kCGScrollWheelEventScrollCount` — non-zero on coalesced continuous scrolls.
+const FIELD_SCROLL_COUNT: core_graphics::event::CGEventField = 100;
+
 /// Everything `Hook` needs to control the background thread.
 pub(crate) struct HookInner {
     thread: thread::JoinHandle<()>,
@@ -404,6 +411,13 @@ fn handle_scroll_event(
 ) -> CallbackResult {
     // Skip our own synthetic frames.
     if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == SYNTHETIC_MARKER {
+        return CallbackResult::Keep;
+    }
+    // Leave trackpads / continuous sources alone: no inversion, no smoothing.
+    let scroll_phase = event.get_double_value_field(FIELD_SCROLL_PHASE);
+    let momentum_phase = event.get_double_value_field(FIELD_MOMENTUM_PHASE);
+    let scroll_count = event.get_integer_value_field(FIELD_SCROLL_COUNT);
+    if crate::scroll::is_trackpad(scroll_phase, momentum_phase, scroll_count) {
         return CallbackResult::Keep;
     }
     let cfg = scroll.load();
