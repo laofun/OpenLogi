@@ -14,13 +14,15 @@
     reason = "fields are read once their owning component lands in UI.md phases 2–4"
 )]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use gpui::Global;
 use openlogi_core::config::{AppSettings, Config, ScrollSettings};
 use openlogi_core::device::DeviceInventory;
-use openlogi_hid::{DeviceRoute, DpiCapabilities, DpiInfo, WriteError};
+use openlogi_hid::{
+    DeviceRoute, DpiCapabilities, DpiInfo, SmartShiftMode, SmartShiftStatus, WriteError,
+};
 use openlogi_hook::Hook;
 use tracing::{debug, warn};
 
@@ -53,6 +55,13 @@ const INVENTORY_MISS_GRACE: u8 = 2;
 /// miss must never permanently mark a capable device as DPI-less.
 const DPI_LOAD_MAX_ATTEMPTS: u8 = 3;
 
+/// How many times to retry a SmartShift status read after a HID++ error before
+/// settling on the retryable [`SmartShiftState::Failed`]. Mirrors
+/// [`DPI_LOAD_MAX_ATTEMPTS`]: a BLE feature-table lookup can miss under load and
+/// return a false `FeatureUnsupported`, so no single error permanently wedges a
+/// genuinely SmartShift-capable device.
+const SMARTSHIFT_LOAD_MAX_ATTEMPTS: u8 = 3;
+
 /// Per-device DPI capability loading state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DpiStatus {
@@ -75,10 +84,26 @@ pub enum DpiStatus {
     Unsupported(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PendingSmartShift {
-    pub ratchet_mode: Option<bool>,
-    pub sensitivity: Option<u8>,
+/// Per-device live SmartShift state, read from the device itself (not from
+/// persisted config). Mirrors [`DpiStatus`]: lazily loaded from `render`, with
+/// transient HID++ errors retried before settling on the retryable `Failed`.
+/// The panel mirrors this — the device keeps whatever mode it powered up in
+/// until the user changes it, and the UI never auto-applies a stored value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SmartShiftState {
+    /// The selected device has not been queried yet.
+    Unknown,
+    /// A background HID++ read is in flight.
+    Loading,
+    /// The device reported its current SmartShift mode and auto-disengage
+    /// sensitivity (raw `1..=255`).
+    Ready {
+        mode: SmartShiftMode,
+        sensitivity: u8,
+    },
+    /// Transient read errors exhausted the retry budget. Retryable by
+    /// re-selecting the device (which drops the recorded status).
+    Failed(String),
 }
 
 pub struct AppState {
@@ -122,6 +147,15 @@ pub struct AppState {
     /// [`DPI_LOAD_MAX_ATTEMPTS`]) before settling on the retryable
     /// [`DpiStatus::Failed`], instead of wedging the device forever.
     dpi_load_attempts: BTreeMap<String, u8>,
+    /// Live SmartShift state keyed by [`DeviceRecord::config_key`], read from the
+    /// device (not config). Loaded lazily on the render path — HID++ reads must
+    /// not block device switching or rendering.
+    pub smartshift_by_device: BTreeMap<String, SmartShiftState>,
+    /// Consecutive failed SmartShift status reads, keyed by
+    /// [`DeviceRecord::config_key`]. Lets a transient read error retry a few
+    /// times (see [`SMARTSHIFT_LOAD_MAX_ATTEMPTS`]) before settling on the
+    /// retryable [`SmartShiftState::Failed`].
+    smartshift_load_attempts: BTreeMap<String, u8>,
     /// All paired devices, in carousel order. Each entry caches the per-
     /// device data the views need so a switch is a pure index update.
     pub device_list: Vec<DeviceRecord>,
@@ -141,12 +175,6 @@ pub struct AppState {
     /// watcher holds the other `Arc` clone, so writes here reach it without
     /// GPUI involvement.
     pub gesture_hook_bindings: Arc<RwLock<BTreeMap<GestureDirection, Action>>>,
-    /// `config_key`s whose persisted SmartShift sensitivity has already been
-    /// evaluated for the current connection (applied, or determined to need no
-    /// write). Pruned to the connected set on each refresh so a
-    /// disconnect→reconnect re-applies. Prevents per-poll-tick re-writes and
-    /// re-reads of the config file.
-    smartshift_applied: HashSet<String>,
 }
 
 impl AppState {
@@ -204,12 +232,13 @@ impl AppState {
             dpi_by_device: BTreeMap::new(),
             inventory_misses: BTreeMap::new(),
             dpi_load_attempts: BTreeMap::new(),
+            smartshift_by_device: BTreeMap::new(),
+            smartshift_load_attempts: BTreeMap::new(),
             device_list,
             config,
             hook_bindings,
             dpi_cycle,
             gesture_hook_bindings,
-            smartshift_applied: HashSet::new(),
         };
         state.button_bindings = state.bindings_for_current();
         state.gesture_bindings = state.gesture_bindings_for_current();
@@ -276,83 +305,6 @@ impl AppState {
         self.device_list.get(self.current_device)
     }
 
-    /// Compute and register the SmartShift settings that must be written
-    /// to freshly-connected devices, returning the pending values keyed by route
-    /// for the caller to dispatch to the background hardware writers.
-    ///
-    /// Behaviour:
-    /// - **Disk is the source of truth.** Reads the persisted value from a
-    ///   fresh [`Config::load_or_default`] rather than the in-memory copy: the
-    ///   CLI's `--save` may have written it after the GUI loaded its copy.
-    /// - **Apply once per connection.** Every connected `config_key` is marked
-    ///   in `smartshift_applied` after evaluation (whether or not it had a
-    ///   value or the dispatch later succeeds), so a sleeping/failing device is
-    ///   not hammered every poll tick. Pruning the set to the connected keys
-    ///   means a disconnect→reconnect re-applies.
-    /// - **Clobber mitigation.** Once observed here, an applied value is synced
-    ///   back into the in-memory `self.config` so the GUI's next full-file
-    ///   `save_atomic()` preserves it instead of overwriting the file without
-    ///   it. This closes the window for any save *after* the refresh that
-    ///   observed the value; a GUI save in the narrow gap between the CLI's
-    ///   `--save` and the next inventory refresh can still drop it (bounded by
-    ///   the ~2 s poll interval).
-    /// - **Steady-state cheap.** When every connected key is already evaluated,
-    ///   returns early without touching the disk.
-    ///
-    /// Call this on every inventory refresh, after `refresh_inventories`.
-    pub fn pending_smartshift_writes(&mut self) -> Vec<(DeviceRoute, PendingSmartShift)> {
-        // Connected = online records that carry a route (offline records can't
-        // be written to).
-        let connected: Vec<String> = self
-            .device_list
-            .iter()
-            .filter(|r| r.online && r.route.is_some())
-            .map(|r| r.config_key.clone())
-            .collect();
-
-        // Drop applied keys that are no longer connected so a reconnect retries.
-        self.smartshift_applied
-            .retain(|key| connected.contains(key));
-
-        // Steady state: nothing new connected since last evaluation — skip the
-        // disk read entirely.
-        if connected
-            .iter()
-            .all(|k| self.smartshift_applied.contains(k))
-        {
-            return Vec::new();
-        }
-
-        let disk = Config::load_or_default().unwrap_or_default();
-        let pending = smartshift_pending(&disk, &connected, &self.smartshift_applied);
-
-        let mut writes = Vec::new();
-        for (key, pending) in pending {
-            if let Some(mode) = pending.ratchet_mode {
-                self.config.set_smartshift_ratchet_mode(&key, Some(mode));
-            }
-            if let Some(value) = pending.sensitivity {
-                self.config.set_smartshift_sensitivity(&key, Some(value));
-            }
-            if let Some(route) = self
-                .device_list
-                .iter()
-                .find(|r| r.config_key == key)
-                .and_then(|r| r.route.clone())
-            {
-                writes.push((route, pending));
-            }
-        }
-
-        // Mark every connected key evaluated (including no-value devices) so we
-        // don't re-read the config file on every subsequent poll tick.
-        for key in connected {
-            self.smartshift_applied.insert(key);
-        }
-
-        writes
-    }
-
     /// Replace [`Self::device_list`] from a fresh inventory snapshot,
     /// preserving the carousel selection by `config_key` when possible. If
     /// the previously-selected device disappeared, the selection falls back
@@ -369,7 +321,7 @@ impl AppState {
         // fresh route must replace the stale one so reads/writes don't target a
         // dead index. `online` is part of the comparison so an offline↔online
         // transition (same key + route) isn't swallowed — otherwise the stale
-        // flag would mislead `pending_smartshift_writes` and the carousel.
+        // flag would mislead the carousel and the SmartShift/DPI lazy reads.
         let unchanged = merged_list.len() == self.device_list.len()
             && merged_list
                 .iter()
@@ -482,11 +434,19 @@ impl AppState {
         }
         self.current_device = idx;
         // A device left in `Failed` (transient read errors exhausted its retry
-        // budget) gets one fresh attempt each time it is re-selected.
+        // budget) gets one fresh attempt each time it is re-selected. Applies to
+        // both the DPI and SmartShift lazy reads, which retry independently.
         if let Some(key) = self.current_record().map(|r| r.config_key.clone()) {
             if matches!(self.dpi_by_device.get(&key), Some(DpiStatus::Failed(_))) {
                 self.dpi_by_device.remove(&key);
                 self.dpi_load_attempts.remove(&key);
+            }
+            if matches!(
+                self.smartshift_by_device.get(&key),
+                Some(SmartShiftState::Failed(_))
+            ) {
+                self.smartshift_by_device.remove(&key);
+                self.smartshift_load_attempts.remove(&key);
             }
         }
         // `self.dpi` is the active device's value; adopt the newly-selected
@@ -536,40 +496,6 @@ impl AppState {
         }
     }
 
-    #[must_use]
-    pub fn active_smartshift_ratchet_mode(&self) -> Option<bool> {
-        self.current_record()
-            .and_then(|record| self.config.smartshift_ratchet_mode(&record.config_key))
-    }
-
-    #[must_use]
-    pub fn active_smartshift_sensitivity(&self) -> Option<u8> {
-        self.current_record()
-            .and_then(|record| self.config.smartshift_sensitivity(&record.config_key))
-    }
-
-    pub fn commit_active_smartshift_ratchet_mode(&mut self, value: bool) {
-        let Some(key) = self.current_record().map(|r| r.config_key.clone()) else {
-            debug!("no active device key — SmartShift mode not persisted");
-            return;
-        };
-        self.config.set_smartshift_ratchet_mode(&key, Some(value));
-        if let Err(e) = self.config.save_atomic() {
-            warn!(error = %e, "could not persist SmartShift mode");
-        }
-    }
-
-    pub fn commit_active_smartshift_sensitivity(&mut self, value: u8) {
-        let Some(key) = self.current_record().map(|r| r.config_key.clone()) else {
-            debug!("no active device key — SmartShift sensitivity not persisted");
-            return;
-        };
-        self.config.set_smartshift_sensitivity(&key, Some(value));
-        if let Err(e) = self.config.save_atomic() {
-            warn!(error = %e, "could not persist SmartShift sensitivity");
-        }
-    }
-
     /// Read the DPI preset list for the active device, or an empty `Vec`
     /// when no device is selected. UI helper.
     #[must_use]
@@ -594,6 +520,123 @@ impl AppState {
     pub fn current_dpi_unqueried(&self) -> bool {
         self.current_record()
             .is_some_and(|record| !self.dpi_by_device.contains_key(&record.config_key))
+    }
+
+    /// Live SmartShift state for the active device.
+    #[must_use]
+    pub fn current_smartshift_status(&self) -> SmartShiftState {
+        self.current_record()
+            .and_then(|record| self.smartshift_by_device.get(&record.config_key).cloned())
+            .unwrap_or(SmartShiftState::Unknown)
+    }
+
+    /// Whether the active device still needs a SmartShift read (no status
+    /// recorded). Drives the lazy load on the render path.
+    #[must_use]
+    pub fn current_smartshift_unqueried(&self) -> bool {
+        self.current_record()
+            .is_some_and(|record| !self.smartshift_by_device.contains_key(&record.config_key))
+    }
+
+    /// Mark a SmartShift status read as in flight for `key`.
+    pub fn mark_smartshift_loading(&mut self, key: &str) {
+        self.smartshift_by_device
+            .insert(key.to_string(), SmartShiftState::Loading);
+    }
+
+    /// Reset a stuck `Loading` for `key` back to `Unknown`, so a worker that
+    /// vanished without delivering a result doesn't wedge the device.
+    pub fn clear_smartshift_loading(&mut self, key: &str) {
+        if matches!(
+            self.smartshift_by_device.get(key),
+            Some(SmartShiftState::Loading)
+        ) {
+            self.smartshift_by_device.remove(key);
+        }
+    }
+
+    /// Store a SmartShift status read result if it still matches the known
+    /// device route. Guards against async reads landing after the carousel or
+    /// inventory changed. Transient errors re-probe up to
+    /// [`SMARTSHIFT_LOAD_MAX_ATTEMPTS`] before settling on the retryable
+    /// `Failed` — mirroring [`Self::store_dpi_info`].
+    pub fn store_smartshift_status(
+        &mut self,
+        key: String,
+        route: &DeviceRoute,
+        result: Result<SmartShiftStatus, WriteError>,
+    ) {
+        let still_matches = self
+            .device_list
+            .iter()
+            .any(|record| record.config_key == key && record.route.as_ref() == Some(route));
+        if !still_matches {
+            debug!(key, ?route, "stale SmartShift status result ignored");
+            if self
+                .device_list
+                .iter()
+                .any(|record| record.config_key == key)
+            {
+                self.smartshift_by_device.remove(&key);
+            }
+            return;
+        }
+
+        let status = match result {
+            Ok(status) => {
+                self.smartshift_load_attempts.remove(&key);
+                SmartShiftState::Ready {
+                    mode: status.mode,
+                    sensitivity: status.sensitivity,
+                }
+            }
+            Err(error) => {
+                let attempts = self
+                    .smartshift_load_attempts
+                    .entry(key.clone())
+                    .or_insert(0);
+                *attempts = attempts.saturating_add(1);
+                if *attempts < SMARTSHIFT_LOAD_MAX_ATTEMPTS {
+                    debug!(
+                        key,
+                        attempts = *attempts,
+                        error = %error,
+                        "transient SmartShift read error — will retry"
+                    );
+                    self.smartshift_by_device.remove(&key);
+                    return;
+                }
+                self.smartshift_load_attempts.remove(&key);
+                SmartShiftState::Failed(error.to_string())
+            }
+        };
+        self.smartshift_by_device.insert(key, status);
+    }
+
+    /// Optimistically reflect a user-initiated SmartShift mode change on the
+    /// active device's live state, so the UI updates immediately without waiting
+    /// for a read-back. No-op unless the device is already `Ready` (the toggle
+    /// is only interactive then).
+    pub fn set_active_smartshift_mode_optimistic(&mut self, mode: SmartShiftMode) {
+        if let Some(key) = self.current_record().map(|r| r.config_key.clone()) {
+            if let Some(SmartShiftState::Ready { mode: m, .. }) =
+                self.smartshift_by_device.get_mut(&key)
+            {
+                *m = mode;
+            }
+        }
+    }
+
+    /// Optimistically reflect a user-initiated sensitivity change on the active
+    /// device's live state. No-op unless the device is already `Ready`.
+    pub fn set_active_smartshift_sensitivity_optimistic(&mut self, sensitivity: u8) {
+        if let Some(key) = self.current_record().map(|r| r.config_key.clone()) {
+            if let Some(SmartShiftState::Ready { sensitivity: s, .. }) =
+                self.smartshift_by_device.get_mut(&key)
+            {
+                *s = sensitivity;
+            }
+        }
     }
 
     /// The active device's known DPI, falling back to [`DEFAULT_DPI`] until its
@@ -988,32 +1031,6 @@ impl AppState {
 
 impl Global for AppState {}
 
-/// Given the persisted config, the `config_key`s currently connected, and the
-/// set already evaluated this session, return the `(config_key, pending)` pairs
-/// that still need firmware writes. Pure — no I/O, fully unit-testable.
-///
-/// The caller ([`AppState::pending_smartshift_writes`]) is responsible for
-/// pruning `already_applied` of keys no longer connected so a reconnect
-/// re-applies, and for marking keys applied after dispatch.
-fn smartshift_pending(
-    config: &Config,
-    connected: &[String],
-    applied: &HashSet<String>,
-) -> Vec<(String, PendingSmartShift)> {
-    connected
-        .iter()
-        .filter(|key| !applied.contains(*key))
-        .filter_map(|key| {
-            let pending = PendingSmartShift {
-                ratchet_mode: config.smartshift_ratchet_mode(key),
-                sensitivity: config.smartshift_sensitivity(key).filter(|&v| v != 0),
-            };
-            (pending.ratchet_mode.is_some() || pending.sensitivity.is_some())
-                .then(|| (key.clone(), pending))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used, reason = "expect/unwrap are idiomatic in tests")]
 mod tests {
@@ -1023,11 +1040,6 @@ mod tests {
         DeviceInventory, DeviceKind, DeviceModelInfo, DeviceTransports, PairedDevice, ReceiverInfo,
     };
     use openlogi_hid::DIRECT_DEVICE_INDEX;
-    use std::collections::HashSet;
-
-    fn keys(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| (*s).to_string()).collect()
-    }
 
     /// Minimal BLE-direct inventory for an MX Master 2S (046d:b019), the device
     /// upstream does not support. Mirrors what `inventory::enumerate` produces
@@ -1153,134 +1165,153 @@ mod tests {
     }
 
     #[test]
-    fn pending_returns_persisted_value_on_first_connect() {
-        let mut cfg = Config::default();
-        cfg.set_smartshift_sensitivity("2b042", Some(20));
-        let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &HashSet::new());
+    fn smartshift_unqueried_until_stored() {
+        let (state, _key, _route) = mx_master_2s_state();
+        assert!(state.current_smartshift_unqueried());
+        assert_eq!(state.current_smartshift_status(), SmartShiftState::Unknown);
+    }
+
+    #[test]
+    fn store_smartshift_status_presents_ready_mode_and_sensitivity() {
+        let (mut state, key, route) = mx_master_2s_state();
+        state.store_smartshift_status(
+            key,
+            &route,
+            Ok(SmartShiftStatus {
+                mode: SmartShiftMode::Ratchet,
+                sensitivity: 24,
+            }),
+        );
         assert_eq!(
-            pending,
-            vec![(
-                "2b042".to_string(),
-                PendingSmartShift {
-                    ratchet_mode: None,
-                    sensitivity: Some(20),
-                },
-            )]
+            state.current_smartshift_status(),
+            SmartShiftState::Ready {
+                mode: SmartShiftMode::Ratchet,
+                sensitivity: 24,
+            }
+        );
+        assert!(!state.current_smartshift_unqueried());
+    }
+
+    /// A transient `FeatureUnsupported` (a BLE feature-table miss under load)
+    /// must retry rather than permanently mark a SmartShift-capable device as
+    /// unsupported — same hazard the DPI path guards against. Errors re-probe
+    /// until the budget is exhausted, then settle on the retryable `Failed`.
+    #[test]
+    fn smartshift_feature_unsupported_settles_on_failed_after_retries() {
+        let (mut state, key, route) = mx_master_2s_state();
+        let err = || WriteError::FeatureUnsupported {
+            feature_hex: 0x2111,
+        };
+        for attempt in 1..SMARTSHIFT_LOAD_MAX_ATTEMPTS {
+            state.store_smartshift_status(key.clone(), &route, Err(err()));
+            assert_eq!(
+                state.current_smartshift_status(),
+                SmartShiftState::Unknown,
+                "attempt {attempt}: expected Unknown (re-probe)"
+            );
+        }
+        state.store_smartshift_status(key.clone(), &route, Err(err()));
+        assert!(
+            matches!(
+                state.current_smartshift_status(),
+                SmartShiftState::Failed(_)
+            ),
+            "exhausted budget must settle on Failed, got {:?}",
+            state.current_smartshift_status()
         );
     }
 
     #[test]
-    fn pending_skips_already_applied() {
-        let mut cfg = Config::default();
-        cfg.set_smartshift_sensitivity("2b042", Some(20));
-        let applied: HashSet<String> = ["2b042".to_string()].into_iter().collect();
-        let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &applied);
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn pending_skips_device_without_value() {
-        let cfg = Config::default(); // no persisted sensitivity for 2b042
-        let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &HashSet::new());
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn pending_skips_stored_zero() {
-        let mut cfg = Config::default();
-        cfg.set_smartshift_sensitivity("2b042", Some(0)); // hand-edited no-op
-        let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &HashSet::new());
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn pending_keeps_mode_when_stored_sensitivity_is_zero() {
-        let mut cfg = Config::default();
-        cfg.set_smartshift_ratchet_mode("2b042", Some(true));
-        cfg.set_smartshift_sensitivity("2b042", Some(0)); // stored zero remains a no-op
-        let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &HashSet::new());
-        assert_eq!(
-            pending,
-            vec![(
-                "2b042".to_string(),
-                PendingSmartShift {
-                    ratchet_mode: Some(true),
-                    sensitivity: None,
-                },
-            )]
+    fn smartshift_recovers_to_ready_after_transient_failures() {
+        let (mut state, key, route) = mx_master_2s_state();
+        let err = || WriteError::FeatureUnsupported {
+            feature_hex: 0x2111,
+        };
+        state.store_smartshift_status(key.clone(), &route, Err(err()));
+        state.store_smartshift_status(key.clone(), &route, Err(err()));
+        assert_eq!(state.current_smartshift_status(), SmartShiftState::Unknown);
+        state.store_smartshift_status(
+            key.clone(),
+            &route,
+            Ok(SmartShiftStatus {
+                mode: SmartShiftMode::Free,
+                sensitivity: 10,
+            }),
         );
-    }
-
-    fn pending_reapplies_after_key_pruned_from_applied() {
-        let mut cfg = Config::default();
-        cfg.set_smartshift_sensitivity("2b042", Some(20));
-        // Simulate a reconnect: the key was applied, then pruned (disconnect).
-        let applied = HashSet::new();
-        let pending = smartshift_pending(&cfg, &keys(&["2b042"]), &applied);
-        assert_eq!(
-            pending,
-            vec![(
-                "2b042".to_string(),
-                PendingSmartShift {
-                    ratchet_mode: None,
-                    sensitivity: Some(20),
-                },
-            )]
-        );
+        assert!(matches!(
+            state.current_smartshift_status(),
+            SmartShiftState::Ready { .. }
+        ));
     }
 
     #[test]
-    fn pending_handles_multiple_devices() {
-        let mut cfg = Config::default();
-        cfg.set_smartshift_sensitivity("2b042", Some(20));
-        cfg.set_smartshift_sensitivity("4082d", Some(255));
-        let applied: HashSet<String> = ["2b042".to_string()].into_iter().collect();
-        let pending = smartshift_pending(&cfg, &keys(&["2b042", "4082d"]), &applied);
+    fn stale_smartshift_result_ignored() {
+        let (mut state, _key, route) = mx_master_2s_state();
+        state.store_smartshift_status(
+            "deadbeef".to_string(),
+            &route,
+            Ok(SmartShiftStatus {
+                mode: SmartShiftMode::Ratchet,
+                sensitivity: 24,
+            }),
+        );
+        assert_eq!(state.current_smartshift_status(), SmartShiftState::Unknown);
+    }
+
+    #[test]
+    fn optimistic_mode_update_changes_active_ready_status() {
+        let (mut state, key, route) = mx_master_2s_state();
+        state.store_smartshift_status(
+            key,
+            &route,
+            Ok(SmartShiftStatus {
+                mode: SmartShiftMode::Free,
+                sensitivity: 24,
+            }),
+        );
+        state.set_active_smartshift_mode_optimistic(SmartShiftMode::Ratchet);
         assert_eq!(
-            pending,
-            vec![(
-                "4082d".to_string(),
-                PendingSmartShift {
-                    ratchet_mode: None,
-                    sensitivity: Some(255),
-                },
-            )]
+            state.current_smartshift_status(),
+            SmartShiftState::Ready {
+                mode: SmartShiftMode::Ratchet,
+                sensitivity: 24,
+            }
         );
     }
 
     #[test]
-    fn smartshift_pending_collects_mode_and_sensitivity_once() {
-        let mut cfg = Config::default();
-        cfg.set_smartshift_ratchet_mode("0b019", Some(true));
-        cfg.set_smartshift_sensitivity("0b019", Some(25));
-        let connected = vec!["0b019".to_string()];
-        let applied = HashSet::new();
-
-        let pending = smartshift_pending(&cfg, &connected, &applied);
-
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].0, "0b019");
-        assert_eq!(pending[0].1.ratchet_mode, Some(true));
-        assert_eq!(pending[0].1.sensitivity, Some(25));
+    fn optimistic_sensitivity_update_changes_active_ready_status() {
+        let (mut state, key, route) = mx_master_2s_state();
+        state.store_smartshift_status(
+            key,
+            &route,
+            Ok(SmartShiftStatus {
+                mode: SmartShiftMode::Ratchet,
+                sensitivity: 24,
+            }),
+        );
+        state.set_active_smartshift_sensitivity_optimistic(100);
+        assert_eq!(
+            state.current_smartshift_status(),
+            SmartShiftState::Ready {
+                mode: SmartShiftMode::Ratchet,
+                sensitivity: 100,
+            }
+        );
     }
 
     #[test]
-    fn smartshift_pending_skips_already_evaluated_devices() {
-        let mut cfg = Config::default();
-        cfg.set_smartshift_ratchet_mode("0b019", Some(false));
-        let connected = vec!["0b019".to_string()];
-        let applied = HashSet::from(["0b019".to_string()]);
-
-        let pending = smartshift_pending(&cfg, &connected, &applied);
-
-        assert!(pending.is_empty());
+    fn optimistic_update_noop_when_not_ready() {
+        let (mut state, _key, _route) = mx_master_2s_state();
+        state.set_active_smartshift_mode_optimistic(SmartShiftMode::Ratchet);
+        assert_eq!(state.current_smartshift_status(), SmartShiftState::Unknown);
     }
 
     /// A device that goes offline while keeping its `config_key` and route must
     /// still flip its `online` flag on the next refresh. The `unchanged`
     /// short-circuit compares routes/keys to skip quiet polls — but it must not
     /// swallow online↔offline transitions, or downstream consumers
-    /// (`pending_smartshift_writes`, the carousel) keep acting on a stale state.
+    /// (the SmartShift/DPI lazy reads, the carousel) keep acting on a stale state.
     #[test]
     fn refresh_inventories_tracks_online_transition_on_same_route() {
         let cache = AssetResolver::new();

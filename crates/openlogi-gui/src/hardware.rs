@@ -15,7 +15,8 @@
 use std::time::Duration;
 
 use openlogi_hid::{
-    CaptureChannel, DeviceRoute, DpiInfo, SharedChannel, SmartShiftMode, WriteError,
+    CaptureChannel, DeviceRoute, DpiInfo, SharedChannel, SmartShiftMode, SmartShiftStatus,
+    WriteError,
 };
 use tracing::{debug, warn};
 
@@ -53,6 +54,25 @@ pub fn read_dpi_info_blocking(target: &DeviceRoute) -> Result<DpiInfo, WriteErro
         tokio::time::timeout(WRITE_BUDGET, openlogi_hid::get_dpi_info(target))
             .await
             .map_err(|_| WriteError::Hidpp("DPI info read timed out".into()))?
+    })
+}
+
+/// Read the current SmartShift mode + auto-disengage sensitivity on a
+/// background worker. Companion to [`read_dpi_info_blocking`]: intentionally
+/// blocking so GPUI callers can run it on a dedicated OS thread without the UI
+/// thread owning a Tokio runtime.
+pub fn read_smartshift_status_blocking(
+    target: &DeviceRoute,
+) -> Result<SmartShiftStatus, WriteError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| WriteError::Hidpp(format!("tokio runtime init failed: {e}")))?;
+
+    rt.block_on(async {
+        tokio::time::timeout(WRITE_BUDGET, openlogi_hid::get_smartshift_status(target))
+            .await
+            .map_err(|_| WriteError::Hidpp("SmartShift status read timed out".into()))?
     })
 }
 
@@ -163,17 +183,15 @@ pub fn set_smartshift_mode_in_background(
     });
 }
 
-/// Spawn an OS thread that writes a persisted SmartShift auto-disengage
-/// `value` (1–255) to the device at `target` via
-/// `openlogi_hid::set_smartshift_sensitivity`, preserving the current mode.
-/// Used by the GUI auto-apply path when a device connects. Returns
-/// immediately; failures (incl. devices exposing neither `0x2111` nor the
-/// older `0x2110` SmartShift feature) are logged, never retried within the
-/// call.
+/// Spawn an OS thread that writes a SmartShift auto-disengage `value` (1–255)
+/// to the device at `target` via `openlogi_hid::set_smartshift_sensitivity`,
+/// preserving the current mode. Invoked when the user releases the SmartShift
+/// sensitivity slider. Returns immediately; failures (incl. devices exposing
+/// neither `0x2111` nor the older `0x2110` SmartShift feature) are logged,
+/// never retried within the call.
 ///
 /// Unlike the toggle/DPI writers this always opens a fresh channel — there is
-/// no channel-reusing `set_smartshift_sensitivity_on` variant, and the sole
-/// caller (inventory refresh) runs with no capture session bound.
+/// no channel-reusing `set_smartshift_sensitivity_on` variant.
 ///
 /// `target == None` is a no-op (dev environment without a real device).
 pub fn apply_smartshift_sensitivity_in_background(target: Option<DeviceRoute>, value: u8) {

@@ -11,7 +11,7 @@ use gpui::{
     Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    h_flex,
+    Disableable, h_flex,
     slider::{Slider, SliderEvent, SliderState},
     switch::Switch,
     v_flex,
@@ -21,7 +21,7 @@ use openlogi_hid::{DeviceRoute, SmartShiftMode};
 
 use crate::hardware;
 use crate::hook_runtime;
-use crate::state::AppState;
+use crate::state::{AppState, SmartShiftState};
 use crate::theme;
 
 /// Slider column width. Matches the right-column layout in `app.rs`.
@@ -59,11 +59,11 @@ impl ScrollPanel {
         let horizontal_step = cx.new(|_| step_slider_state(settings.horizontal_step));
         let duration = cx.new(|_| duration_slider_state(settings.duration));
         let dead_zone = cx.new(|_| dead_zone_slider_state(settings.dead_zone));
-        let smartshift_default = cx
-            .try_global::<AppState>()
-            .map_or_else(default_smartshift_percent, smartshift_percent_from_state);
+        // Seeded to the default; `sync_smartshift_slider` re-seats it from the
+        // device's live state once the lazy read lands (Ready). The device is
+        // never driven from this initial value — it's display-only until Ready.
         let smartshift_sensitivity =
-            cx.new(|_| smartshift_slider_state(f32::from(smartshift_default)));
+            cx.new(|_| smartshift_slider_state(f32::from(default_smartshift_percent())));
 
         let mut subs = Vec::with_capacity(7);
         subs.push(subscribe_scroll_slider(
@@ -143,10 +143,47 @@ impl ScrollPanel {
         cx.notify();
     }
 
+    /// Kick off a one-shot SmartShift status read for the active device when it
+    /// hasn't been queried yet. Mirrors [`crate::components::dpi_panel`]'s
+    /// `ensure_dpi_load`: triggered from `render`, runs the blocking HID++ read
+    /// on a dedicated OS thread, and stores the result back on the global. This
+    /// is the read-only path — the device keeps whatever mode it powered up in;
+    /// the UI just mirrors it.
+    fn ensure_smartshift_load(cx: &mut Context<Self>) {
+        let Some((key, route)) = smartshift_load_target(cx) else {
+            return;
+        };
+
+        cx.update_global::<AppState, _>(|state, _| state.mark_smartshift_loading(&key));
+        let key_for_reset = key.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = hardware::read_smartshift_status_blocking(&route);
+            let _ = tx.send((key, route, result));
+        });
+        cx.spawn(async move |_panel, cx| {
+            match rx.await {
+                Ok((key, route, result)) => {
+                    cx.update_global::<AppState, _>(|state, cx| {
+                        state.store_smartshift_status(key, &route, result);
+                        cx.refresh_windows();
+                    });
+                }
+                // The worker vanished without sending (e.g. it panicked). Reset
+                // the `Loading` marker so the device isn't stuck on "reading…".
+                Err(_) => {
+                    cx.update_global::<AppState, _>(|state, cx| {
+                        state.clear_smartshift_loading(&key_for_reset);
+                        cx.refresh_windows();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
     fn sync_smartshift_slider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let percent = cx
-            .try_global::<AppState>()
-            .map_or_else(default_smartshift_percent, smartshift_percent_from_state);
+        let percent = smartshift_percent_from_state(cx);
         self.smartshift_sensitivity.update(cx, |state, cx| {
             let target = f32::from(percent);
             if smartshift_slider_needs_sync(state.value().start(), target) {
@@ -156,9 +193,10 @@ impl ScrollPanel {
     }
 
     fn apply_smartshift_sensitivity_release(percent: f32, cx: &mut Context<Self>) {
-        let (ratchet_mode, target) = active_smartshift_snapshot(cx);
-        if !ratchet_mode {
-            // Re-seat from persisted state on the next render when a window is available.
+        let (ratchet_mode, target, _percent, ready) = smartshift_render_snapshot(cx);
+        if !ready || !ratchet_mode {
+            // Not interactive yet (device unread) or sensitivity does not apply
+            // in Free mode; re-seat the thumb from live state on the next render.
             cx.notify();
             return;
         }
@@ -166,25 +204,26 @@ impl ScrollPanel {
         let percent = round_slider_percent(percent);
         let raw = hardware::smartshift_percent_to_raw(percent);
         cx.update_global::<AppState, _>(|state, _| {
-            state.commit_active_smartshift_sensitivity(raw);
+            state.set_active_smartshift_sensitivity_optimistic(raw);
         });
         hardware::apply_smartshift_sensitivity_in_background(target, raw);
         cx.notify();
     }
 
     fn set_ratchet_mode(enabled: bool, cx: &mut Context<Self>) {
-        let target = cx.try_global::<AppState>().and_then(|state| {
-            state
-                .current_record()
-                .and_then(|record| record.route.clone())
-        });
+        let (_ratchet_mode, target, _percent, ready) = smartshift_render_snapshot(cx);
+        if !ready {
+            // The toggle is only interactive once the live state is known.
+            cx.notify();
+            return;
+        }
         let mode = if enabled {
             SmartShiftMode::Ratchet
         } else {
             SmartShiftMode::Free
         };
         cx.update_global::<AppState, _>(|state, _| {
-            state.commit_active_smartshift_ratchet_mode(enabled);
+            state.set_active_smartshift_mode_optimistic(mode);
         });
         hardware::set_smartshift_mode_in_background(None, target, mode);
         cx.notify();
@@ -218,10 +257,14 @@ impl Render for ScrollPanel {
         reason = "right-column settings panel composes several small grouped sections inline"
     )]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        Self::ensure_smartshift_load(cx);
         self.sync_smartshift_slider(window, cx);
         let pal = theme::palette(cx);
-        let (ratchet_mode, target, smartshift_percent) = smartshift_render_snapshot(cx);
-        let smartshift_disabled = !ratchet_mode || target.is_none();
+        let (ratchet_mode, target, smartshift_percent, ready) = smartshift_render_snapshot(cx);
+        // The toggle is interactive once the device's live state is known; the
+        // sensitivity slider additionally requires Ratchet mode to be on.
+        let toggle_disabled = !ready || target.is_none();
+        let smartshift_disabled = toggle_disabled || !ratchet_mode;
 
         v_flex()
             .gap_4()
@@ -344,6 +387,7 @@ impl Render for ScrollPanel {
                             .child(
                                 Switch::new("smartshift-ratchet")
                                     .checked(ratchet_mode)
+                                    .disabled(toggle_disabled)
                                     .on_click(cx.listener(|_this, checked: &bool, _window, cx| {
                                         Self::set_ratchet_mode(*checked, cx);
                                     })),
@@ -469,39 +513,64 @@ fn smartshift_slider_state(value: f32) -> SliderState {
         .default_value(value)
 }
 
-fn smartshift_percent_from_state(state: &AppState) -> u8 {
-    state.active_smartshift_sensitivity().map_or_else(
-        default_smartshift_percent,
-        hardware::smartshift_raw_to_percent,
-    )
+/// The active device's SmartShift sensitivity as a slider percentage, derived
+/// from its live state. Falls back to the default until the device reports
+/// `Ready` (Unknown / Loading / Failed).
+fn smartshift_percent_from_state(cx: &mut Context<ScrollPanel>) -> u8 {
+    match cx
+        .try_global::<AppState>()
+        .map(AppState::current_smartshift_status)
+    {
+        Some(SmartShiftState::Ready { sensitivity, .. }) => {
+            hardware::smartshift_raw_to_percent(sensitivity)
+        }
+        _ => default_smartshift_percent(),
+    }
 }
 
 fn default_smartshift_percent() -> u8 {
     hardware::smartshift_raw_to_percent(DEFAULT_SMARTSHIFT_RAW)
 }
 
-fn active_smartshift_snapshot(cx: &mut Context<ScrollPanel>) -> (bool, Option<DeviceRoute>) {
-    cx.try_global::<AppState>().map_or((false, None), |state| {
-        (
-            state.active_smartshift_ratchet_mode().unwrap_or(false),
-            state
-                .current_record()
-                .and_then(|record| record.route.clone()),
-        )
-    })
+/// `(ratchet_mode, target_route, sensitivity_percent, ready)` for the active
+/// device, read from its live SmartShift state. `ready` is true only once the
+/// device has reported its mode + sensitivity; until then the toggle shows off
+/// and both controls are disabled.
+fn smartshift_render_snapshot(
+    cx: &mut Context<ScrollPanel>,
+) -> (bool, Option<DeviceRoute>, u8, bool) {
+    let target = cx.try_global::<AppState>().and_then(|state| {
+        state
+            .current_record()
+            .and_then(|record| record.route.clone())
+    });
+    let status = cx.try_global::<AppState>().map_or(
+        SmartShiftState::Unknown,
+        AppState::current_smartshift_status,
+    );
+    match status {
+        SmartShiftState::Ready { mode, sensitivity } => (
+            mode == SmartShiftMode::Ratchet,
+            target,
+            hardware::smartshift_raw_to_percent(sensitivity),
+            true,
+        ),
+        SmartShiftState::Unknown | SmartShiftState::Loading | SmartShiftState::Failed(_) => {
+            (false, target, default_smartshift_percent(), false)
+        }
+    }
 }
 
-fn smartshift_render_snapshot(cx: &mut Context<ScrollPanel>) -> (bool, Option<DeviceRoute>, u8) {
-    cx.try_global::<AppState>()
-        .map_or((false, None, default_smartshift_percent()), |state| {
-            (
-                state.active_smartshift_ratchet_mode().unwrap_or(false),
-                state
-                    .current_record()
-                    .and_then(|record| record.route.clone()),
-                smartshift_percent_from_state(state),
-            )
-        })
+/// The active device's `(config_key, route)` when it still needs a SmartShift
+/// read — i.e. its live state is `Unknown`. Mirrors `dpi_panel::dpi_load_target`.
+fn smartshift_load_target(cx: &mut Context<ScrollPanel>) -> Option<(String, DeviceRoute)> {
+    cx.try_global::<AppState>().and_then(|state| {
+        if !state.current_smartshift_unqueried() {
+            return None;
+        }
+        let record = state.current_record()?;
+        Some((record.config_key.clone(), record.route.clone()?))
+    })
 }
 
 fn smartshift_slider_needs_sync(current: f32, target: f32) -> bool {

@@ -245,34 +245,20 @@ fn main() -> Result<()> {
                             let inv = new_inv.clone();
                             std::thread::spawn(move || sync_assets_if_needed(&inv));
                         }
-                        let writes = cx.update(|cx| {
+                        // Read-only on connect: refresh the inventory and let
+                        // the SmartShift panel mirror each device's live state
+                        // (lazy-read on render). We never auto-apply a stored
+                        // SmartShift value — the device keeps whatever mode it
+                        // powered up in until the user changes it in the app.
+                        cx.update(|cx| {
                             let cache = asset::AssetResolver::new();
-                            let writes = cx.update_global::<AppState, _>(|state, _| {
+                            cx.update_global::<AppState, _>(|state, _| {
                                 state.refresh_inventories(&new_inv, &cache);
                                 state.scanning = false;
-                                state.pending_smartshift_writes()
                             });
                             #[cfg(target_os = "macos")]
                             platform::tray::set_device_status(&tray_status(cx));
-                            writes
                         });
-                        // Off the GPUI thread: re-apply each connected device's
-                        // persisted SmartShift settings (fresh channel).
-                        // Once per connection — see
-                        // AppState::pending_smartshift_writes.
-                        for (route, pending) in writes {
-                            if let Some(ratchet_mode) = pending.ratchet_mode {
-                                let mode = if ratchet_mode {
-                                    openlogi_hid::SmartShiftMode::Ratchet
-                                } else {
-                                    openlogi_hid::SmartShiftMode::Free
-                                };
-                                hardware::set_smartshift_mode_in_background(None, Some(route.clone()), mode);
-                            }
-                            if let Some(value) = pending.sensitivity {
-                                hardware::apply_smartshift_sensitivity_in_background(Some(route), value);
-                            }
-                        }
                     }
                     Some(bundle) = app_rx.recv() => {
                         cx.update(|cx| {
