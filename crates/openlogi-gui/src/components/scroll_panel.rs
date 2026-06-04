@@ -39,6 +39,11 @@ pub struct ScrollPanel {
     duration: Entity<SliderState>,
     dead_zone: Entity<SliderState>,
     smartshift_sensitivity: Entity<SliderState>,
+    /// The device-derived percent we last pushed into `smartshift_sensitivity`.
+    /// Drives [`smartshift_slider_needs_reseat`] so the thumb is only re-seated
+    /// on an actual device-state change, never on every render (which would
+    /// fight the user's drag).
+    last_seated_smartshift_percent: Option<u8>,
     _state_obs: Subscription,
     #[allow(dead_code, reason = "held to keep slider subscriptions alive")]
     _subs: Vec<Subscription>,
@@ -112,6 +117,7 @@ impl ScrollPanel {
             duration,
             dead_zone,
             smartshift_sensitivity,
+            last_seated_smartshift_percent: None,
             _state_obs: state_obs,
             _subs: subs,
         }
@@ -184,11 +190,15 @@ impl ScrollPanel {
 
     fn sync_smartshift_slider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let percent = smartshift_percent_from_state(cx);
+        if !smartshift_slider_needs_reseat(self.last_seated_smartshift_percent, percent) {
+            // Device value unchanged since we last seated the thumb — leave it
+            // where the user put it. Re-seating here would yank a mid-drag thumb
+            // back to the stored value on every async re-render.
+            return;
+        }
+        self.last_seated_smartshift_percent = Some(percent);
         self.smartshift_sensitivity.update(cx, |state, cx| {
-            let target = f32::from(percent);
-            if smartshift_slider_needs_sync(state.value().start(), target) {
-                state.set_value(target, &mut *window, cx);
-            }
+            state.set_value(f32::from(percent), &mut *window, cx);
         });
     }
 
@@ -573,8 +583,17 @@ fn smartshift_load_target(cx: &mut Context<ScrollPanel>) -> Option<(String, Devi
     })
 }
 
-fn smartshift_slider_needs_sync(current: f32, target: f32) -> bool {
-    (current - target).abs() > f32::EPSILON
+/// Decide whether to re-seat the SmartShift slider from the device's live
+/// state. We compare the device-derived percent against the value we *last
+/// pushed into the slider* — never against the slider's current thumb position.
+///
+/// This is the fix for the "slider fights the drag" bug: the device-derived
+/// percent only changes on a fresh read, a device switch, or our own optimistic
+/// update at release — none of which happen while the user is dragging. So an
+/// async re-render mid-drag (inventory watcher, accessibility refresh, …) no
+/// longer snaps the thumb back to the stored value.
+fn smartshift_slider_needs_reseat(last_seated: Option<u8>, device_percent: u8) -> bool {
+    last_seated != Some(device_percent)
 }
 
 #[allow(
@@ -612,8 +631,14 @@ mod tests {
     }
 
     #[test]
-    fn smartshift_slider_sync_only_when_percent_changes() {
-        assert!(!smartshift_slider_needs_sync(42.0, 42.0));
-        assert!(smartshift_slider_needs_sync(41.0, 42.0));
+    fn smartshift_slider_reseats_only_on_device_percent_change() {
+        // Nothing seated yet (first render) -> seat from device state.
+        assert!(smartshift_slider_needs_reseat(None, 9));
+        // Device value unchanged since the last seat -> leave the thumb alone,
+        // so a user mid-drag (device percent stays put) is never fought.
+        assert!(!smartshift_slider_needs_reseat(Some(50), 50));
+        // Device value changed (fresh read, device switch, optimistic release)
+        // -> re-seat the thumb to mirror it.
+        assert!(smartshift_slider_needs_reseat(Some(0), 50));
     }
 }
