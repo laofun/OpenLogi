@@ -110,7 +110,7 @@ The non-obvious traps. Details and code references in
   smoothing) and returns *before* invoking `cb`, so `MouseEvent::Scroll` is never
   delivered — wheel input is consumed by inversion/smoothing, not dispatchable as
   an action. When smoothing an axis the tap swallows the original event (`Drop`)
-  and re-emits interpolated frames via `CGEventPostToPid` on the CVDisplayLink
+  and re-emits interpolated frames at the HID tap location on the CVDisplayLink
   thread; those carry a synthetic marker so the tap skips its own output. See
   `openlogi-hook/src/macos.rs` + `scroll.rs`, and
   [`docs/FORK-DIVERGENCE.md`](docs/FORK-DIVERGENCE.md) §4.
