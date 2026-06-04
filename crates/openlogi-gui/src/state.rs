@@ -367,12 +367,16 @@ impl AppState {
         // Compare routes too, not just config_key: a device can reconnect on a
         // new HID++ index while keeping its model-derived config_key, and the
         // fresh route must replace the stale one so reads/writes don't target a
-        // dead index.
+        // dead index. `online` is part of the comparison so an offline↔online
+        // transition (same key + route) isn't swallowed — otherwise the stale
+        // flag would mislead `pending_smartshift_writes` and the carousel.
         let unchanged = merged_list.len() == self.device_list.len()
             && merged_list
                 .iter()
                 .zip(self.device_list.iter())
-                .all(|(a, b)| a.config_key == b.config_key && a.route == b.route);
+                .all(|(a, b)| {
+                    a.config_key == b.config_key && a.route == b.route && a.online == b.online
+                });
         if unchanged {
             return;
         }
@@ -1031,6 +1035,10 @@ mod tests {
     /// pinned at [`DIRECT_DEVICE_INDEX`], so [`build_device_list`] resolves a
     /// single `DeviceRoute::Direct` record at index 0. `config_key` is `"0b019"`.
     fn mx_master_2s_inventory() -> DeviceInventory {
+        mx_master_2s_inventory_with_online(true)
+    }
+
+    fn mx_master_2s_inventory_with_online(online: bool) -> DeviceInventory {
         DeviceInventory {
             receiver: ReceiverInfo {
                 name: "MX Master 2S".to_string(),
@@ -1043,7 +1051,7 @@ mod tests {
                 codename: Some("MX Master 2S".to_string()),
                 wpid: Some(0xb019),
                 kind: DeviceKind::Mouse,
-                online: true,
+                online,
                 battery: None,
                 model_info: Some(DeviceModelInfo {
                     entity_count: 0,
@@ -1266,5 +1274,26 @@ mod tests {
         let pending = smartshift_pending(&cfg, &connected, &applied);
 
         assert!(pending.is_empty());
+    }
+
+    /// A device that goes offline while keeping its `config_key` and route must
+    /// still flip its `online` flag on the next refresh. The `unchanged`
+    /// short-circuit compares routes/keys to skip quiet polls — but it must not
+    /// swallow online↔offline transitions, or downstream consumers
+    /// (`pending_smartshift_writes`, the carousel) keep acting on a stale state.
+    #[test]
+    fn refresh_inventories_tracks_online_transition_on_same_route() {
+        let cache = AssetResolver::new();
+        let online = mx_master_2s_inventory_with_online(true);
+        let mut state = AppState::with_runtime(Config::default(), &[online], &cache);
+        assert!(state.device_list[0].online, "device starts online");
+
+        let offline = mx_master_2s_inventory_with_online(false);
+        state.refresh_inventories(&[offline], &cache);
+
+        assert!(
+            !state.device_list[0].online,
+            "offline snapshot must update online even when config_key/route are unchanged"
+        );
     }
 }
