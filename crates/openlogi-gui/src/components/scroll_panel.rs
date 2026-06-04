@@ -149,22 +149,34 @@ impl ScrollPanel {
         cx.notify();
     }
 
-    /// Kick off a one-shot SmartShift status read for the active device when it
-    /// hasn't been queried yet. Mirrors [`crate::components::dpi_panel`]'s
-    /// `ensure_dpi_load`: triggered from `render`, runs the blocking HID++ read
+    /// Kick off a one-shot SmartShift sync for the active device when it hasn't
+    /// been queried yet. Mirrors [`crate::components::dpi_panel`]'s
+    /// `ensure_dpi_load`: triggered from `render`, runs the blocking HID++ work
     /// on a dedicated OS thread, and stores the result back on the global. This
-    /// is the read-only path — the device keeps whatever mode it powered up in;
-    /// the UI just mirrors it.
+    /// is also the connect-time auto-apply path — any value persisted in
+    /// `config.toml` is written to the device first, then the live state is
+    /// read back so the UI mirrors what actually took.
     fn ensure_smartshift_load(cx: &mut Context<Self>) {
         let Some((key, route)) = smartshift_load_target(cx) else {
             return;
         };
 
+        // Read the persisted mode/sensitivity for this device before spawning
+        // the worker: the lazy read doubles as the connect-time auto-apply, so
+        // any stored value is written to the device first, then read back. A
+        // device with nothing persisted gets a plain read (`(None, None)`).
+        let (persist_mode, persist_sensitivity) = cx
+            .try_global::<AppState>()
+            .map_or((None, None), |state| state.smartshift_persisted(&key));
         cx.update_global::<AppState, _>(|state, _| state.mark_smartshift_loading(&key));
         let key_for_reset = key.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
-            let result = hardware::read_smartshift_status_blocking(&route);
+            let result = hardware::sync_smartshift_status_blocking(
+                &route,
+                persist_mode,
+                persist_sensitivity,
+            );
             let _ = tx.send((key, route, result));
         });
         cx.spawn(async move |_panel, cx| {
@@ -215,6 +227,7 @@ impl ScrollPanel {
         let raw = hardware::smartshift_percent_to_raw(percent);
         cx.update_global::<AppState, _>(|state, _| {
             state.set_active_smartshift_sensitivity_optimistic(raw);
+            state.commit_smartshift_sensitivity(raw);
         });
         hardware::apply_smartshift_sensitivity_in_background(target, raw);
         cx.notify();
@@ -234,6 +247,7 @@ impl ScrollPanel {
         };
         cx.update_global::<AppState, _>(|state, _| {
             state.set_active_smartshift_mode_optimistic(mode);
+            state.commit_smartshift_mode(enabled);
         });
         hardware::set_smartshift_mode_in_background(None, target, mode);
         cx.notify();

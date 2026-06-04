@@ -84,11 +84,12 @@ pub enum DpiStatus {
     Unsupported(String),
 }
 
-/// Per-device live SmartShift state, read from the device itself (not from
-/// persisted config). Mirrors [`DpiStatus`]: lazily loaded from `render`, with
-/// transient HID++ errors retried before settling on the retryable `Failed`.
-/// The panel mirrors this — the device keeps whatever mode it powered up in
-/// until the user changes it, and the UI never auto-applies a stored value.
+/// Per-device live SmartShift state, read back from the device itself (not a
+/// copy of persisted config). Mirrors [`DpiStatus`]: lazily loaded from
+/// `render`, with transient HID++ errors retried before settling on the
+/// retryable `Failed`. On the lazy read any value persisted in `config.toml` is
+/// first applied to the device, so `Ready` reflects the user's stored choice
+/// once it has taken (see `ScrollPanel::ensure_smartshift_load`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SmartShiftState {
     /// The selected device has not been queried yet.
@@ -364,10 +365,18 @@ impl AppState {
         for key in &rerouted {
             self.dpi_by_device.remove(key);
             self.dpi_load_attempts.remove(key);
+            // SmartShift is keyed to the route too: a device back on a new
+            // index must re-read (and thus re-apply the persisted value).
+            self.smartshift_by_device.remove(key);
+            self.smartshift_load_attempts.remove(key);
         }
         self.dpi_by_device
             .retain(|key, _| self.device_list.iter().any(|r| r.config_key == *key));
         self.dpi_load_attempts
+            .retain(|key, _| self.device_list.iter().any(|r| r.config_key == *key));
+        self.smartshift_by_device
+            .retain(|key, _| self.device_list.iter().any(|r| r.config_key == *key));
+        self.smartshift_load_attempts
             .retain(|key, _| self.device_list.iter().any(|r| r.config_key == *key));
         self.current_device = new_index;
         // The active device may have changed (selection fell back to index 0
@@ -494,6 +503,48 @@ impl AppState {
         if let Err(e) = self.config.save_atomic() {
             warn!(error = %e, "could not persist scroll settings");
         }
+    }
+
+    /// Persist the active device's SmartShift sensitivity (`raw`, 1–255) to
+    /// `config.toml` under its model-id key — the same field the CLI
+    /// `diag smartshift --save` writes, so the GUI re-applies it on connect.
+    /// No-op when no device is selected; disk failures are logged, not
+    /// propagated. Mirrors [`Self::commit_scroll_settings`].
+    pub fn commit_smartshift_sensitivity(&mut self, raw: u8) {
+        let Some(key) = self.current_record().map(|r| r.config_key.clone()) else {
+            debug!("no active device key — SmartShift sensitivity kept in memory only");
+            return;
+        };
+        self.config.set_smartshift_sensitivity(&key, Some(raw));
+        if let Err(e) = self.config.save_atomic() {
+            warn!(error = %e, "could not persist SmartShift sensitivity to config.toml");
+        }
+    }
+
+    /// Persist the active device's SmartShift ratchet/free mode to
+    /// `config.toml` under its model-id key. No-op when no device is selected;
+    /// disk failures are logged, not propagated.
+    pub fn commit_smartshift_mode(&mut self, ratchet: bool) {
+        let Some(key) = self.current_record().map(|r| r.config_key.clone()) else {
+            debug!("no active device key — SmartShift mode kept in memory only");
+            return;
+        };
+        self.config.set_smartshift_ratchet_mode(&key, Some(ratchet));
+        if let Err(e) = self.config.save_atomic() {
+            warn!(error = %e, "could not persist SmartShift mode to config.toml");
+        }
+    }
+
+    /// Read the persisted `(ratchet_mode, sensitivity)` for `key` from config.
+    /// Drives the connect-time auto-apply: these values are written to the
+    /// device during its lazy SmartShift read so it comes up at the user's
+    /// chosen setting. Either component is `None` when never persisted.
+    #[must_use]
+    pub fn smartshift_persisted(&self, key: &str) -> (Option<bool>, Option<u8>) {
+        (
+            self.config.smartshift_ratchet_mode(key),
+            self.config.smartshift_sensitivity(key),
+        )
     }
 
     /// Read the DPI preset list for the active device, or an empty `Vec`
@@ -1305,6 +1356,90 @@ mod tests {
         let (mut state, _key, _route) = mx_master_2s_state();
         state.set_active_smartshift_mode_optimistic(SmartShiftMode::Ratchet);
         assert_eq!(state.current_smartshift_status(), SmartShiftState::Unknown);
+    }
+
+    /// A GUI sensitivity edit must persist (raw, 1–255) under the active
+    /// device's model-id key — the same key the CLI `diag smartshift --save`
+    /// writes — so the value survives a relaunch and can be re-applied.
+    #[test]
+    fn commit_smartshift_sensitivity_persists_raw_under_active_key() {
+        let (mut state, key, _route) = mx_master_2s_state();
+        assert_eq!(key, "0b019");
+        state.commit_smartshift_sensitivity(42);
+        assert_eq!(state.config.smartshift_sensitivity("0b019"), Some(42));
+    }
+
+    /// A GUI Ratchet-mode toggle must persist under the active device's key.
+    #[test]
+    fn commit_smartshift_mode_persists_under_active_key() {
+        let (mut state, _key, _route) = mx_master_2s_state();
+        state.commit_smartshift_mode(true);
+        assert_eq!(state.config.smartshift_ratchet_mode("0b019"), Some(true));
+        state.commit_smartshift_mode(false);
+        assert_eq!(state.config.smartshift_ratchet_mode("0b019"), Some(false));
+    }
+
+    /// With no active device the commit helpers must not panic and must persist
+    /// nothing — mirrors `commit_dpi_presets`'s no-active-device guard.
+    #[test]
+    fn commit_smartshift_settings_noop_without_active_device() {
+        let mut state = AppState::with_runtime(Config::default(), &[], &AssetResolver::new());
+        assert!(state.current_record().is_none());
+        state.commit_smartshift_sensitivity(42);
+        state.commit_smartshift_mode(true);
+        assert_eq!(state.config.smartshift_sensitivity("0b019"), None);
+        assert_eq!(state.config.smartshift_ratchet_mode("0b019"), None);
+    }
+
+    /// The auto-apply path reads persisted `(ratchet_mode, sensitivity)` from
+    /// config for a device key before its lazy read, so they can be written to
+    /// the device on connect.
+    #[test]
+    fn smartshift_persisted_reads_config() {
+        let (mut state, _key, _route) = mx_master_2s_state();
+        assert_eq!(state.smartshift_persisted("0b019"), (None, None));
+        state
+            .config
+            .set_smartshift_ratchet_mode("0b019", Some(true));
+        state.config.set_smartshift_sensitivity("0b019", Some(77));
+        assert_eq!(state.smartshift_persisted("0b019"), (Some(true), Some(77)));
+    }
+
+    /// A device returning on a new HID++ route must drop its cached SmartShift
+    /// status + attempt count, so the next render re-reads (and thus re-applies
+    /// the persisted value) against the live route — mirroring the DPI reroute
+    /// clear.
+    #[test]
+    fn refresh_inventories_clears_smartshift_on_reroute() {
+        let cache = AssetResolver::new();
+        let mut state =
+            AppState::with_runtime(Config::default(), &[mx_master_2s_inventory()], &cache);
+        state.smartshift_by_device.insert(
+            "0b019".to_string(),
+            SmartShiftState::Ready {
+                mode: SmartShiftMode::Ratchet,
+                sensitivity: 24,
+            },
+        );
+        state
+            .smartshift_load_attempts
+            .insert("0b019".to_string(), 1);
+
+        // Same device (model_ids → config_key "0b019") but on a different
+        // direct route: a changed receiver product id flips the resolved
+        // `DeviceRoute::Direct` while the config_key (model-id derived) holds.
+        let mut rerouted = mx_master_2s_inventory();
+        rerouted.receiver.product_id = 0xb01a;
+        state.refresh_inventories(&[rerouted], &cache);
+
+        assert!(
+            !state.smartshift_by_device.contains_key("0b019"),
+            "rerouted device must drop its cached SmartShift status"
+        );
+        assert!(
+            !state.smartshift_load_attempts.contains_key("0b019"),
+            "rerouted device must drop its SmartShift attempt count"
+        );
     }
 
     /// A device that goes offline while keeping its `config_key` and route must

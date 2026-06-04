@@ -57,12 +57,22 @@ pub fn read_dpi_info_blocking(target: &DeviceRoute) -> Result<DpiInfo, WriteErro
     })
 }
 
-/// Read the current SmartShift mode + auto-disengage sensitivity on a
-/// background worker. Companion to [`read_dpi_info_blocking`]: intentionally
-/// blocking so GPUI callers can run it on a dedicated OS thread without the UI
-/// thread owning a Tokio runtime.
-pub fn read_smartshift_status_blocking(
+/// Apply any persisted SmartShift settings to the device, then read back its
+/// live mode + auto-disengage sensitivity, on a background worker. Companion to
+/// [`read_dpi_info_blocking`]: intentionally blocking so GPUI callers can run it
+/// on a dedicated OS thread without the UI thread owning a Tokio runtime.
+///
+/// `persist_mode` / `persist_sensitivity` are the values stored in
+/// `config.toml` for this device (`None` when never persisted). When `Some`,
+/// each is written best-effort — a failed write is logged and skipped, never
+/// aborting the read-back — so the panel always settles on the device's true
+/// live state even if the apply didn't land. `(None, None)` reduces to a plain
+/// status read (the read-only path). The whole apply-then-read sequence shares
+/// one [`WRITE_BUDGET`] timeout.
+pub fn sync_smartshift_status_blocking(
     target: &DeviceRoute,
+    persist_mode: Option<bool>,
+    persist_sensitivity: Option<u8>,
 ) -> Result<SmartShiftStatus, WriteError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -70,10 +80,59 @@ pub fn read_smartshift_status_blocking(
         .map_err(|e| WriteError::Hidpp(format!("tokio runtime init failed: {e}")))?;
 
     rt.block_on(async {
-        tokio::time::timeout(WRITE_BUDGET, openlogi_hid::get_smartshift_status(target))
-            .await
-            .map_err(|_| WriteError::Hidpp("SmartShift status read timed out".into()))?
+        tokio::time::timeout(WRITE_BUDGET, async {
+            let applied_mode = match persist_mode {
+                Some(ratchet) => {
+                    let mode = if ratchet {
+                        SmartShiftMode::Ratchet
+                    } else {
+                        SmartShiftMode::Free
+                    };
+                    match openlogi_hid::set_smartshift_mode(target, mode).await {
+                        Ok(_) => Some(mode),
+                        Err(e) => {
+                            warn!(error = ?e, "auto-apply SmartShift mode failed; reading live state");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            let applied_sensitivity = match persist_sensitivity {
+                Some(raw) => match openlogi_hid::set_smartshift_sensitivity(target, raw).await {
+                    Ok(_) => Some(raw),
+                    Err(e) => {
+                        warn!(error = ?e, "auto-apply SmartShift sensitivity failed; reading live state");
+                        None
+                    }
+                },
+                None => None,
+            };
+            let read_back = openlogi_hid::get_smartshift_status(target).await?;
+            Ok(seat_smartshift_status(read_back, applied_mode, applied_sensitivity))
+        })
+        .await
+        .map_err(|_| WriteError::Hidpp("SmartShift sync timed out".into()))?
     })
+}
+
+/// Seat the panel's view of SmartShift state, preferring the values we *just
+/// applied* over the device read-back. A successful HID++ write is the
+/// authoritative source for the field it set — the read-back exists only to
+/// recover fields we did not touch. This matters on the MX Master 2S (`0x2110`),
+/// whose immediate post-write read can return a stale mode/sensitivity (see
+/// `openlogi-hid`'s `smartshift_backend`); trusting the applied value sidesteps
+/// that race. `None` for either argument (nothing persisted, or the write
+/// failed) falls back to the read-back for that field.
+fn seat_smartshift_status(
+    read_back: SmartShiftStatus,
+    applied_mode: Option<SmartShiftMode>,
+    applied_sensitivity: Option<u8>,
+) -> SmartShiftStatus {
+    SmartShiftStatus {
+        mode: applied_mode.unwrap_or(read_back.mode),
+        sensitivity: applied_sensitivity.unwrap_or(read_back.sensitivity),
+    }
 }
 
 /// Clone out the capture session's channel when it reaches `route`. `None` when
@@ -307,5 +366,42 @@ mod tests {
         assert_eq!(smartshift_raw_to_percent(1), 0);
         assert_eq!(smartshift_raw_to_percent(255), 100);
         assert_eq!(smartshift_raw_to_percent(25), 9);
+    }
+
+    #[test]
+    fn seat_prefers_applied_mode_over_stale_readback() {
+        // The MX Master 2S can answer a read issued right after a write with a
+        // stale value. A successful mode write is authoritative, so the applied
+        // mode must win over the read-back.
+        let read_back = SmartShiftStatus {
+            mode: SmartShiftMode::Ratchet,
+            sensitivity: 30,
+        };
+        let seated = seat_smartshift_status(read_back, Some(SmartShiftMode::Free), None);
+        assert_eq!(seated.mode, SmartShiftMode::Free);
+        assert_eq!(seated.sensitivity, 30);
+    }
+
+    #[test]
+    fn seat_prefers_applied_sensitivity_over_stale_readback() {
+        let read_back = SmartShiftStatus {
+            mode: SmartShiftMode::Free,
+            sensitivity: 30,
+        };
+        let seated = seat_smartshift_status(read_back, None, Some(200));
+        assert_eq!(seated.mode, SmartShiftMode::Free);
+        assert_eq!(seated.sensitivity, 200);
+    }
+
+    #[test]
+    fn seat_falls_back_to_readback_when_nothing_applied() {
+        // Nothing persisted (or both writes failed) → trust the device entirely.
+        let read_back = SmartShiftStatus {
+            mode: SmartShiftMode::Ratchet,
+            sensitivity: 42,
+        };
+        let seated = seat_smartshift_status(read_back, None, None);
+        assert_eq!(seated.mode, SmartShiftMode::Ratchet);
+        assert_eq!(seated.sensitivity, 42);
     }
 }

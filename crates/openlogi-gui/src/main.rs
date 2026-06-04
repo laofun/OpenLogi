@@ -245,11 +245,12 @@ fn main() -> Result<()> {
                             let inv = new_inv.clone();
                             std::thread::spawn(move || sync_assets_if_needed(&inv));
                         }
-                        // Read-only on connect: refresh the inventory and let
-                        // the SmartShift panel mirror each device's live state
-                        // (lazy-read on render). We never auto-apply a stored
-                        // SmartShift value — the device keeps whatever mode it
-                        // powered up in until the user changes it in the app.
+                        // Refresh the inventory; the SmartShift panel drives the
+                        // per-device sync on its next render (lazy-read), which
+                        // also applies any value persisted in config.toml to the
+                        // device before reading its live state back. A device
+                        // returning on a new route has its cached status cleared
+                        // here, so it re-syncs (and thus re-applies).
                         cx.update(|cx| {
                             let cache = asset::AssetResolver::new();
                             cx.update_global::<AppState, _>(|state, _| {
